@@ -1,0 +1,26 @@
+[Unit]
+Description=hestia-box egress firewall (v4 FORWARD/INPUT + v6 FORWARD/INPUT for lxdbr0)
+Documentation=man:iptables(8) man:ip6tables(8)
+# lxdbr0 is created by the LXD snap daemon; DOCKER-USER (v4) is (re)created by
+# Docker. On reboot Docker recreates DOCKER-USER EMPTY, so we must re-apply
+# AFTER docker is up and AFTER lxdbr0 exists. network-online.target gives us a
+# stable network. Only "Wants" docker so a masked/absent docker can't wedge boot.
+After=docker.service snap.lxd.daemon.service network-online.target
+Wants=docker.service snap.lxd.daemon.service network-online.target
+# Retry policy lives in [Unit] for systemd >= 229.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Optional overrides (HESTIA_BRIDGE, CONTAINER_SUBNET_V4, ...). Addressing is
+# otherwise auto-detected from the live bridge, so this file is not required.
+EnvironmentFile=-/etc/hestia/box.env
+ExecStart=/usr/local/sbin/hestia-box-egress.sh
+# Re-apply is safe (idempotent) and fail-closed; do not thrash on transient err.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

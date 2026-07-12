@@ -1,0 +1,85 @@
+// ============================================================================
+// Hestia — example Tailscale ACL (Phase 2 broker path)
+//
+// Paste this into your tailnet's Access Controls (HuJSON — comments allowed).
+// It grants the SINGLE narrow path the broker needs and nothing else:
+//
+//     the broker host  ---(Tailscale SSH)--->  the target executor user
+//     tag:hestia-broker  -->  tag:hestia-target, as user `hestia-agent`, ssh only
+//
+// The confined box is NOT on the tailnet at all (the egress firewall blocks the
+// whole tailnet CIDR, v4 + v6), so it cannot appear here and cannot reach the
+// target. Only the host-side broker can — and every command it relays is still
+// gated by the owner's Telegram button. This ACL is the network half of the
+// capability wall; the button is the human half.
+//
+// Replace every <PLACEHOLDER>. Tag the two machines with the tags below in the
+// admin console (or via `tailscale up --advertise-tags=...`).
+// ============================================================================
+{
+  // --- Who owns which tag (required before a device may claim a tag) --------
+  "tagOwners": {
+    // The host that runs the broker daemon (and the mailbox mover).
+    "tag:hestia-broker": ["autogroup:admin"],
+    // The target machine (the owner's laptop/host) the agent acts on.
+    "tag:hestia-target": ["autogroup:admin"],
+  },
+
+  // --- Network ACLs ---------------------------------------------------------
+  // Default-deny tailnet: we add ONLY the rules Hestia needs. Keep (or merge
+  // with) your own existing rules; do NOT add a blanket allow-all.
+  "acls": [
+    // The broker host may reach the target — but ONLY over SSH (tcp/22). The
+    // actual command authorization happens in the "ssh" block below; this is
+    // the L3/L4 half. No other port, no other direction.
+    {
+      "action": "accept",
+      "src": ["tag:hestia-broker"],
+      "dst": ["tag:hestia-target:22"],
+    },
+  ],
+
+  // --- Tailscale SSH ---------------------------------------------------------
+  // Allow the broker host to `tailscale ssh hestia-agent@<target>` — this is
+  // exactly how the broker invokes the target executor. `hestia-agent` is the
+  // restricted unix user created on the target (install/target); it is the ONLY
+  // user the broker may SSH in as. `checkPeriod` forces periodic re-check.
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["tag:hestia-broker"],
+      "dst": ["tag:hestia-target"],
+      "users": ["hestia-agent"],
+      "checkPeriod": "12h",
+    },
+  ],
+
+  // --- Optional: pin the tags to specific devices ---------------------------
+  // Restrict which nodes may carry each tag by hostname/IP if you like. Example
+  // tailnet placeholders — replace with your own tailnet name and hosts:
+  //   broker host : <your-broker-host>.<your-tailnet>.ts.net
+  //   target host : <your-target-host>.<your-tailnet>.ts.net
+  //
+  // "hosts": {
+  //   "broker": "<your-broker-host>.<your-tailnet>.ts.net",
+  //   "target": "<your-target-host>.<your-tailnet>.ts.net",
+  // },
+
+  // --- Tests (recommended) --------------------------------------------------
+  // Assert the intended path is allowed and nothing wider leaks in. `tailscale`
+  // validates these on save.
+  "tests": [
+    {
+      "src": "tag:hestia-broker",
+      "accept": ["tag:hestia-target:22"],
+    },
+  ],
+
+  "sshTests": [
+    {
+      "src": "tag:hestia-broker",
+      "dst": "tag:hestia-target",
+      "accept": ["hestia-agent"],
+    },
+  ],
+}

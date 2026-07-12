@@ -1,0 +1,30 @@
+[Unit]
+# Hestia mailbox mover (dumb pipe: confined box <-> host spool).
+# Ported from the proven Part-2 unit. The `lxc` client is a snap app
+# (/usr/sbin/lxc -> /snap/bin/lxc); systemd sandboxing (ProtectHome / ProtectSystem
+# / NoNewPrivileges / PrivateTmp) can break snap's runtime, so this unit is kept
+# MINIMAL and snap-safe. HOME is pinned so snap/lxc can write its client state under
+# the (0700) mover home in /home. Fuller hardening lives on the broker unit, which is
+# not a snap app.
+Description=Hestia mailbox mover (dumb pipe: box <-> host spool)
+After=snap.lxd.daemon.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hestia-mover
+Group=hestia-mover
+SupplementaryGroups=lxd hestia-spool
+# HOME must be under /home so snap/lxc can write client state (snap refuses homes
+# outside /home). Runtime site values come from the environment below.
+Environment=HOME=/home/hestia-mover
+Environment=HESTIA_LXC=/usr/sbin/lxc
+Environment=CONTAINER_NAME=hestia-box
+Environment=AGENT_BOX_USER=hestia
+Environment=HESTIA_SPOOL=/var/lib/hestia-spool
+ExecStart=/usr/local/lib/hestia/mover.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

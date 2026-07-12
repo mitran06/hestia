@@ -1,0 +1,19 @@
+# /etc/sudoers.d/hestia-elevated  (install 0440 root:root; validate with visudo -cf)
+#
+# The ENTIRE elevated capability is this: hestia-agent may run ONE fixed, root-owned wrapper,
+# passwordless, with NO argument wildcard. Everything variable (the approved argv, run-as, ticket)
+# travels INSIDE the single opaque base64 token the wrapper parses itself; sudo sees only the wrapper
+# path plus that one token. There is no per-binary rule, no ALL, no wildcard binary — so the sudoers
+# grant cannot be widened by argument, and the box cannot pick what runs as root: only a broker-minted,
+# owner-button-bound ticket inside the token lets the wrapper proceed (defense-in-depth check B/C).
+#
+# Runas_Spec: the wrapper starts as root (it must, to setuid to the owner user per the approved
+# run_as) so we grant root. The wrapper itself permanently drops to the configured owner user.
+#
+# NOTE the two entries are the SAME binary with a fixed first-arg discriminator (exec vs --kill); we
+# keep them explicit so the audit log shows which path was taken and so --kill can never carry a payload.
+
+Cmnd_Alias HESTIA_ELEV      = /usr/local/lib/hestia/exec-argv-elevated
+Defaults!HESTIA_ELEV        !requiretty, env_reset, secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+hestia-agent ALL=(root) NOPASSWD: HESTIA_ELEV

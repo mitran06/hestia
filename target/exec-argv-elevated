@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""exec-argv-elevated — target PRIVILEGED wrapper for owner-APPROVED ELEVATED commands.
+
+Invoked (via ONE narrow NOPASSWD sudoers line) as ROOT:
+    sudo -n /usr/local/lib/hestia/exec-argv-elevated run  <base64 run-ticket>
+    sudo -n /usr/local/lib/hestia/exec-argv-elevated kill <base64 kill-ticket>
+Authenticates a BROKER-SIGNED HMAC ticket, then (for `run`) PERMANENTLY drops privilege to run_as
+(the configured owner user) and execve's the approved argv — reaching the OWNER's own files (the acid test).
+ELEVATION is a BROKER-HELD capability: without the shared key no ticket is forgeable, so a host-local
+caller who can reach hestia-agent's SSH path STILL cannot elevate. The box can't reach the tailnet at all.
+
+Ticket = base64(json({v,action,session_id,request_id,cwd,run_as,argv,exec_token,issued, "sig":HMAC})).
+sig = HMAC-SHA256(key, json.dumps(ticket_without_sig, sort_keys=True, separators=(',',':'))).
+Defences: HMAC (unforgeable) + TTL (freshness) + single-use marker on NON-tmpfs (no cross-reboot replay)
++ caller==hestia-agent + run_as allowlist + PERMANENT setres[ug]id drop + shell=False execve + killpg revoke.
+"""
+import sys, os, json, base64, hmac, hashlib, time, signal, pwd, re, stat as _stat
+
+KEY_FILE = "/etc/hestia/elevation.key"          # root 0400 (== the broker's shared key)
+RUNDIR   = "/var/lib/hestia-elevated"           # root 0700: pgid + single-use markers (agent CANNOT tamper)
+TTL      = 300                                  # ticket freshness (seconds)
+ALLOWED_RUNAS = {"@OWNER_RUNAS@"}                 # rendered at install to your owner unix user; elevated runs ONLY as that user (never root — review N1)
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+E_USAGE, E_KEY, E_DECODE, E_SIG, E_TTL, E_REPLAY, E_SCHEMA, E_CALLER, E_RUNAS, E_EXEC = 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+
+
+def die(code, msg):
+    sys.stderr.write(f"exec-argv-elevated: {msg}\n"); sys.exit(code)
+
+
+def _uuid(x):
+    return isinstance(x, str) and bool(_UUID.match(x))
+
+
+def _canon(t):
+    return json.dumps({k: v for k, v in t.items() if k != "sig"}, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _load_key():
+    try:
+        with open(KEY_FILE, "rb") as f:
+            k = f.read().strip()
+    except OSError:
+        die(E_KEY, "cannot read elevation key (elevation not configured)")
+    if len(k) < 32:
+        die(E_KEY, "elevation key too short")
+    return k
+
+
+def _check_caller():
+    try:
+        name = pwd.getpwuid(int(os.environ.get("SUDO_UID", "-1"))).pw_name
+    except (ValueError, KeyError):
+        name = None
+    if name != "hestia-agent":
+        die(E_CALLER, "caller is not hestia-agent")
+
+
+def _verify(tok, want_action):
+    try:
+        t = json.loads(base64.b64decode(tok, validate=True).decode("utf-8"))
+    except Exception as e:
+        die(E_DECODE, f"bad ticket encoding: {e}")
+    if not isinstance(t, dict) or "sig" not in t:
+        die(E_SCHEMA, "ticket has no sig")
+    good = hmac.new(_load_key(), _canon(t), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(good, str(t.get("sig", ""))):
+        die(E_SIG, "bad signature (not broker-issued)")
+    if t.get("v") != 1 or t.get("action") != want_action:
+        die(E_SCHEMA, "bad version/action")
+    try:
+        issued = int(t["issued"])
+    except Exception:
+        die(E_SCHEMA, "bad issued")
+    if abs(time.time() - issued) > TTL:
+        die(E_TTL, "ticket expired")
+    return t
+
+
+def _sweep_stale():
+    """Drop pgid/used markers older than 4*TTL so completed runs don't accumulate (bounds pgid recycling)."""
+    try:
+        cutoff = time.time() - TTL * 4
+        for n in os.listdir(RUNDIR):
+            if (n.endswith(".pgid") or n.endswith(".used")) and os.path.getmtime(os.path.join(RUNDIR, n)) < cutoff:
+                try: os.unlink(os.path.join(RUNDIR, n))
+                except OSError: pass
+    except OSError:
+        pass
+
+
+def _ensure_rundir():
+    # NEVER chown/chmod through a symlink: verify it's a root-owned real dir, else refuse (S1). The setup
+    # script provisions it; here we only verify (or create atomically if truly absent).
+    try:
+        st = os.lstat(RUNDIR)
+        if not _stat.S_ISDIR(st.st_mode) or st.st_uid != 0:
+            die(E_SCHEMA, "rundir is not a root-owned directory (refusing)")
+    except FileNotFoundError:
+        os.mkdir(RUNDIR, 0o700)                             # fails (FileExistsError) if a symlink squats the path
+
+
+def _run(tok):
+    _check_caller()
+    t = _verify(tok, "run")
+    for k in ("session_id", "request_id", "cwd", "run_as", "argv", "exec_token"):
+        if k not in t:
+            die(E_SCHEMA, f"missing {k}")
+    rid, etok, run_as, argv, cwd = t["request_id"], t["exec_token"], t["run_as"], t["argv"], t["cwd"]
+    if not (_uuid(rid) and _uuid(etok)):
+        die(E_SCHEMA, "bad request_id/exec_token")
+    if run_as not in ALLOWED_RUNAS:
+        die(E_RUNAS, f"run_as {run_as!r} not allowed")
+    if not (isinstance(argv, list) and argv and all(isinstance(a, str) and "\x00" not in a for a in argv)):
+        die(E_SCHEMA, "bad argv")
+    if not isinstance(cwd, str) or "\x00" in cwd:
+        die(E_SCHEMA, "bad cwd")
+    _ensure_rundir()
+    _sweep_stale()
+    try:                                                    # single-use: O_EXCL marker on NON-tmpfs (/var/lib)
+        os.close(os.open(os.path.join(RUNDIR, rid + ".used"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        die(E_REPLAY, "ticket already used")
+    try:
+        pw = pwd.getpwnam(run_as)
+    except KeyError:
+        die(E_RUNAS, f"user {run_as} not found")
+    os.setpgrp()                                            # own process group -> revocable via killpg
+    with open(os.path.join(RUNDIR, etok + ".pgid"), "w") as f:   # root-owned; agent cannot tamper
+        f.write(str(os.getpid()))
+    try:
+        os.chdir(cwd if os.path.isdir(cwd) else pw.pw_dir)
+    except OSError:
+        os.chdir(pw.pw_dir)
+    if run_as != "root":                                    # PERMANENT drop (gid+groups before uid; no saved-uid)
+        os.initgroups(run_as, pw.pw_gid)
+        os.setresgid(pw.pw_gid, pw.pw_gid, pw.pw_gid)
+        os.setresuid(pw.pw_uid, pw.pw_uid, pw.pw_uid)
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": pw.pw_dir,
+           "USER": run_as, "LOGNAME": run_as, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "SHELL": "/bin/bash"}
+    try:
+        os.execvpe(argv[0], argv, env)                      # shell=False; runs as run_as
+    except FileNotFoundError:
+        die(E_EXEC, f"command not found: {argv[0]!r}")
+    except OSError as e:
+        die(E_EXEC, f"exec failed: {e}")
+
+
+def _kill(tok):
+    _check_caller()
+    t = _verify(tok, "kill")                                # kill is idempotent (broker retries) -> not single-use
+    etok = t.get("exec_token")
+    if not _uuid(etok):
+        die(E_SCHEMA, "bad exec_token")
+    pf = os.path.join(RUNDIR, etok + ".pgid")
+    try:
+        pgid = int(open(pf).read().strip())
+    except Exception:
+        sys.exit(0)                                         # nothing recorded -> nothing to kill
+    if pgid <= 1:
+        die(E_SCHEMA, "refusing to signal pgid <= 1")
+    for s in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, s)
+        except ProcessLookupError:
+            break                                          # group already gone
+        except OSError:
+            pass                                           # transient -> still try SIGKILL
+        time.sleep(0.4)
+    try:
+        os.unlink(pf)
+    except OSError:
+        pass
+    sys.exit(0)
+
+
+def main(av):
+    if os.geteuid() != 0:
+        die(E_CALLER, "must run as root (via the sudoers NOPASSWD entry)")
+    if len(av) == 3 and av[1] == "run":
+        _run(av[2])
+    elif len(av) == 3 and av[1] == "kill":
+        _kill(av[2])
+    else:
+        die(E_USAGE, "usage: exec-argv-elevated run|kill <base64-ticket>")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

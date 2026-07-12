@@ -1,0 +1,21 @@
+# /etc/logrotate.d/hestia-broker — rotate the append-only broker audit log.
+# The log is chattr +a (append-only), so copytruncate CANNOT shrink it; instead we chattr -a around a
+# create-based rotation and re-apply +a in postrotate. Runs as root via the system logrotate cron/timer.
+/var/lib/hestia-broker/log/audit.log {
+    weekly
+    rotate 12
+    missingok
+    notifempty
+    size 50M
+    create 0660 root hestia-broker
+    prerotate
+        /usr/bin/chattr -a /var/lib/hestia-broker/log/audit.log 2>/dev/null || true
+    endscript
+    postrotate
+        /usr/bin/chattr +a /var/lib/hestia-broker/log/audit.log 2>/dev/null || true
+        # re-apply +a to the just-rotated file too so history stays tamper-evident
+        for f in /var/lib/hestia-broker/log/audit.log.*; do
+            [ -f "$f" ] && /usr/bin/chattr +a "$f" 2>/dev/null || true
+        done
+    endscript
+}

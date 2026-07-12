@@ -1,0 +1,99 @@
+# ============================================================================
+# Hestia — example agent config for the confined agent (Phase 1)
+#
+# This is a SANITIZED reference config for running Nous Research "Hermes"
+# (https://github.com/NousResearch/Hermes) as the confined agent INSIDE the
+# hestia-box container. Any OpenAI-compatible agent works; the fields below
+# are Hermes-specific but the ideas (local terminal backend, in-box approval
+# gate, a broker skill) port to other agents.
+#
+# Copy this to the agent's config dir INSIDE the box (Nous Hermes uses
+# `~/.hermes/config.yaml` for the `hestia` user, i.e. /home/hestia/.hermes/).
+# Replace every <PLACEHOLDER>. Nothing secret lives here — the API key and the
+# Telegram bot token are referenced by ENV-VAR NAME only (see comments).
+# ============================================================================
+
+# --- Model provider -------------------------------------------------------
+# Any OpenAI-compatible endpoint. An open-weight model self-hosted (or from a
+# provider you trust) is recommended for a private personal agent.
+#   <LLM_BASE_URL>      full OpenAI-compatible base URL, ending in /v1
+#   <MODEL_NAME>        the model id the endpoint serves
+#   <LLM_API_KEY_ENV>   NAME of the env var that holds the API key (NOT the key)
+model:
+  default: <MODEL_NAME>
+  provider: custom
+  base_url: <LLM_BASE_URL>
+providers:
+  custom:
+    name: My OpenAI-compatible provider
+    base_url: <LLM_BASE_URL>
+    key_env: <LLM_API_KEY_ENV>      # e.g. OPENAI_API_KEY — the key is read from this env var
+    default_model: <MODEL_NAME>
+
+# --- Agent behavior -------------------------------------------------------
+agent:
+  max_turns: 60
+  verbose: false
+  reasoning_effort: medium
+  personalities:
+    helpful: You are a helpful, friendly AI assistant.
+    concise: You are a concise assistant. Keep responses brief and to the point.
+    technical: You are a technical expert. Provide detailed, accurate technical information.
+
+# --- Terminal backend -----------------------------------------------------
+# CRITICAL for Phase 1: `backend: local` means the agent's shell, execute_code,
+# sub-agents and cron all run AS the `hestia` user INSIDE this container. The
+# container IS the blast radius — there is no host/box split to defend. The
+# egress firewall (box/egress-firewall.sh) ensures this box reaches the public
+# internet ONLY, never the host / LAN / tailnet.
+terminal:
+  backend: local
+  cwd: /home/hestia/workspace       # the agent's working dir inside the box
+  timeout: 180
+  home_mode: auto
+
+# --- In-box approval gate (defense-in-depth, NOT the boundary) ------------
+# Hermes' own approval gate protects the box's OWN state (its vault, memory,
+# files) from ungated destruction: it prompts (out-of-band, over the agent's
+# Telegram bot) before dangerous operations like `rm -rf`, `systemctl`, etc.
+# This is a heuristic in-process gate — it is DEFENSE-IN-DEPTH, not a security
+# boundary against a hijacked LLM. The real boundaries are enforced OUTSIDE the
+# LLM: the egress firewall (Phase 1) and the capability broker (Phase 2).
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: false
+
+# --- Secret handling ------------------------------------------------------
+# Secret redaction masks strings that look like API keys / tokens / passwords
+# in tool output, logs, and chat before the model or user sees them. Keep on.
+security:
+  redact_secrets: true
+
+# --- Chat gateway (the agent's OWN Telegram bot) --------------------------
+# This is the AGENT'S chat bot — distinct from the BROKER'S approvals bot
+# (Phase 2), which runs on the host with its own token and gates crossings to
+# the target machine. Restrict both allowlist and home channel to the owner's
+# numeric Telegram user id (get it from @userinfobot).
+gateway:
+  telegram:
+    allowed_user_ids: <OWNER_TELEGRAM_ID>
+  home_channel: <OWNER_TELEGRAM_ID>
+
+# --- Memory ---------------------------------------------------------------
+# Durable notes the agent maintains itself. See SOUL.example.md and
+# MEMORY.example.md for the persona and the infra-notes template. USER notes
+# start empty — the agent learns them; do not pre-fill personal data.
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+
+# --- The broker skill -----------------------------------------------------
+# The ONLY gated path from this confined box to the owner's target machine is
+# the `hestia-relay` client, taught by the broker skill at:
+#     agent/hermes-skill/omen-relay/SKILL.md
+# Install that skill into the agent's skills dir so it knows to REQUEST target
+# actions via `hestia-relay -- CMD ...` (every crossing needs a Telegram
+# button the broker enforces below the LLM). The box holds no key and no route
+# to the target, so a prompt-injected agent literally cannot cross on its own.
+skills:
+  creation_nudge_interval: 15

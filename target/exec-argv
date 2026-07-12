@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""exec-argv — target-side executor for the Hestia capability broker.
+
+Invoked ONLY by the broker, over Tailscale SSH, as:
+    tailscale ssh hestia-agent@<target-host> -- /usr/local/lib/hestia/exec-argv <base64-json>
+The box CANNOT invoke this (it is firewalled off the tailnet); only the host broker can reach it.
+
+Payload (base64 of JSON): {"cwd": str, "argv": [str,...], "workspace_only": bool}
+  - workspace_only=true  (FREE-ZONE, NO human approval): exec-argv INDEPENDENTLY enforces (does NOT
+    trust the broker as the sole gate) that:
+      * argv[0] is a bare name in the read-only allowlist (no interpreters, no writers, no path),
+      * no flag carries an out-of-tree path (`--opt=/abs`, `-f/abs`),
+      * cwd AND every non-flag operand resolve (realpath, symlink-aware) INSIDE /srv/projects.
+  - workspace_only=false (owner-APPROVED via Telegram button): the owner approved this exact command,
+    so no workspace/allowlist restriction — still runs as hestia-agent (DAC-fenced from the owner's
+    private files; reaching those needs the separate per-command sudoers-elevated path).
+Execution is ALWAYS shell=False (os.execvpe) with a SCRUBBED, minimal environment.
+
+The recursive-symlink residual (grep -r / find -L following a symlink INSIDE /srv/projects that points out,
+or a TOCTOU symlink swap) is CLOSED for free-zone by the bubblewrap jail (Part 8): free-zone commands run in
+a mount namespace where ONLY /srv/projects is bound, so paths outside it do not exist. If bwrap is absent,
+exec-argv falls back to the realpath scope check alone (residual returns; DAC still fences most paths).
+"""
+import sys, os, json, base64, re, signal, time
+
+WORKSPACE = "/srv/projects"
+RUNDIR    = "/home/hestia-agent/.hestia-run"   # hestia-agent-writable; holds <token>.pgid for revoke
+BWRAP     = "/usr/bin/bwrap"                    # free-zone jail: only WORKSPACE visible (closes symlink-follow)
+UUID_RE   = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+E_USAGE, E_DECODE, E_SCHEMA, E_SCOPE_CWD, E_SCOPE_ARG, E_CMD, E_NOTFOUND, E_EXEC = 2, 3, 4, 40, 41, 44, 42, 43
+
+
+def _kill_mode(token):
+    """`exec-argv --kill <uuid>`: kill the process group recorded for that exec (revoke in-flight work)."""
+    if not (isinstance(token, str) and UUID_RE.match(token)):
+        die(E_SCHEMA, "kill token is not a uuid")
+    pf = os.path.join(RUNDIR, token + ".pgid")
+    try:
+        pgid = int(open(pf).read().strip())
+    except Exception:
+        sys.exit(0)                              # no pidfile -> nothing in flight / already gone
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            break                                # group already dead
+        except OSError:
+            break
+        time.sleep(0.4)
+    try:
+        os.unlink(pf)
+    except OSError:
+        pass
+    sys.exit(0)
+
+
+def _cleanup_stale():
+    """Best-effort: drop pgid files older than 1h so completed execs don't accumulate."""
+    try:
+        now = time.time()
+        for n in os.listdir(RUNDIR):
+            p = os.path.join(RUNDIR, n)
+            if n.endswith(".pgid") and now - os.path.getmtime(p) > 3600:
+                os.unlink(p)
+    except OSError:
+        pass
+
+# Keep in sync with broker.py FREE_BINARIES (read-only inspectors; NO git/interpreters/rg/sort/writers;
+# NO df/id — zero-operand host-state leakers). NOTE: this wrapper INDEPENDENTLY enforces argv[0]-allowlist
+# + realpath scope containment + glued-path refusal, but does NOT reproduce the broker's per-binary
+# SAFE_SHORT/SAFE_LONG flag semantics; the only workspace_only=true caller (the broker, on IN_SCOPE
+# commands) has already applied that strict flag check. Mirroring the flag policy here is a Part-8
+# hardening (to make this a fully independent gate once the Tailscale ACL is tightened).
+FREE_BINARIES = frozenset({
+    "ls", "cat", "head", "tail", "wc", "stat", "file", "find", "grep", "egrep", "fgrep",
+    "tree", "pwd", "du", "diff", "uniq", "cut", "basename", "dirname",
+    "realpath", "echo", "date", "uname", "sha256sum", "md5sum", "cksum", "nl", "column",
+})
+
+
+def die(code, msg):
+    sys.stderr.write(f"exec-argv: {msg}\n")
+    sys.exit(code)
+
+
+def within(path, base):
+    base = base.rstrip("/")
+    return path == base or path.startswith(base + "/")
+
+
+def main(av):
+    if len(av) == 3 and av[1] == "--kill":
+        _kill_mode(av[2])
+    if len(av) != 2:
+        die(E_USAGE, "usage: exec-argv <base64-json> | exec-argv --kill <uuid>")
+    try:
+        payload = json.loads(base64.b64decode(av[1], validate=True).decode("utf-8"))
+    except Exception as e:
+        die(E_DECODE, f"cannot decode payload: {e}")
+    if not isinstance(payload, dict):
+        die(E_SCHEMA, "payload is not an object")
+    cwd, argv, wo = payload.get("cwd"), payload.get("argv"), payload.get("workspace_only")
+    if not (isinstance(cwd, str) and isinstance(argv, list) and argv
+            and all(isinstance(a, str) and "\x00" not in a for a in argv)
+            and isinstance(wo, bool)):
+        die(E_SCHEMA, "bad schema: need {cwd:str, argv:[str,...], workspace_only:bool}")
+    tok = payload.get("exec_token")                        # optional: enables revoke (process-group kill)
+    if tok is not None and not (isinstance(tok, str) and UUID_RE.match(tok)):
+        die(E_SCHEMA, "exec_token must be a uuid")
+
+    ws_real = os.path.realpath(WORKSPACE)
+    cwd_real = os.path.realpath(cwd)
+
+    def escapes(p):
+        target = p if os.path.isabs(p) else os.path.join(cwd_real, p)
+        return not within(os.path.realpath(target), ws_real)
+
+    if wo:
+        # (1) argv[0] must be a bare, allowlisted read-only command (independent of the broker).
+        cmd = argv[0]
+        if not cmd or "/" in cmd or cmd not in FREE_BINARIES:
+            die(E_CMD, f"argv[0] {cmd!r} not an allowlisted free-zone command")
+        # (2) cwd must resolve inside the workspace.
+        if not within(cwd_real, ws_real):
+            die(E_SCOPE_CWD, f"cwd {cwd!r} -> {cwd_real!r} is outside workspace {ws_real}")
+        # (3) no flag may carry an out-of-tree path; every operand must resolve inside.
+        for a in argv[1:]:
+            if a.startswith("-"):
+                if "=" in a:
+                    rhs = a.split("=", 1)[1]
+                    if rhs and escapes(rhs):
+                        die(E_SCOPE_ARG, f"flag path {a!r} resolves outside workspace")
+                elif "/" in a:
+                    die(E_SCOPE_ARG, f"flag {a!r} carries a glued path")
+                continue
+            if escapes(a):
+                die(E_SCOPE_ARG, f"arg {a!r} resolves outside workspace {ws_real}")
+
+    if not os.path.isdir(cwd_real):
+        die(E_SCOPE_CWD, f"cwd {cwd_real!r} is not a directory")
+    try:
+        os.chdir(cwd_real)
+    except OSError as e:
+        die(E_SCOPE_CWD, f"chdir failed: {e}")
+
+    # scrubbed, minimal environment (drop LD_PRELOAD/BASH_ENV/IFS/... influence channels)
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/hestia-agent",
+           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": os.environ.get("TERM", "dumb")}
+    if tok:
+        # Put this exec (and its children) in its OWN process group so `exec-argv --kill <tok>` can
+        # killpg the whole tree. Record pgid (== our pid after setpgrp) keyed by the broker's token.
+        try:
+            os.setpgrp()
+            os.makedirs(RUNDIR, mode=0o700, exist_ok=True)
+            _cleanup_stale()
+            with open(os.path.join(RUNDIR, tok + ".pgid"), "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass                                           # revoke degrades to local-kill; don't fail exec
+    exe, xargv = argv[0], argv
+    if wo:
+        # FREE-ZONE JAIL (FAIL-CLOSED): bind ONLY the workspace read-only; everything else (incl. /etc) is
+        # absent, so a symlink INSIDE /srv/projects pointing out — or a recursive tool (grep -R / find -L)
+        # following it, or a TOCTOU swap — resolves to nothing. If bwrap is unavailable we REFUSE rather than
+        # run unjailed (the realpath check alone does NOT catch symlinks a recursive tool discovers itself).
+        if not os.path.exists(BWRAP):
+            die(E_EXEC, "free-zone jail unavailable (bwrap missing) — refusing to run unjailed")
+        xargv = [BWRAP, "--ro-bind", "/usr", "/usr",
+                 "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+                 "--symlink", "usr/lib64", "/lib64", "--symlink", "usr/sbin", "/sbin",
+                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                 "--ro-bind", WORKSPACE, WORKSPACE, "--chdir", cwd_real,
+                 "--unshare-all", "--die-with-parent", "--new-session", "--"] + argv
+        exe = BWRAP
+    try:
+        os.execvpe(exe, xargv, env)                        # replaces this process; no shell
+    except FileNotFoundError:
+        die(E_NOTFOUND, f"command not found: {argv[0]!r}")
+    except OSError as e:
+        die(E_EXEC, f"exec failed: {e}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

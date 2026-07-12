@@ -1,0 +1,54 @@
+[Unit]
+# Hestia capability broker (policy + Telegram approval + target relay).
+# Ported from the proven Part-8 hardened unit. The broker is NOT a snap app, so a
+# real sandbox is safe. It needs to: exec tailscale/python, connect the tailscaled
+# unix socket + Telegram HTTPS, and read/write ONLY the spool + its own home.
+#
+# The bot token and all site values are supplied via the EnvironmentFile written by
+# install/host/5-broker-service.sh (/etc/hestia-broker/broker.env, 0600 root:root;
+# systemd reads it as root before dropping to User=hestia-broker).
+Description=Hestia capability broker (policy + Telegram approval + target relay)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hestia-broker
+Group=hestia-broker
+# Site config + the secret bot token (TELEGRAM_BROKER_BOT_TOKEN) + HESTIA_* live here.
+EnvironmentFile=/etc/hestia-broker/broker.env
+# Pin the paths this deployment uses (the audit log matches the Part-3 chattr +a file).
+Environment=HESTIA_SPOOL=/var/lib/hestia-spool
+Environment=HESTIA_AUDIT=/var/lib/hestia-broker/log/audit.log
+Environment=HESTIA_TAILSCALE=/usr/bin/tailscale
+Environment=HESTIA_EXECARGV=/usr/local/lib/hestia/exec-argv
+Environment=HESTIA_ELEV_WRAPPER=/usr/local/lib/hestia/exec-argv-elevated
+Environment=HESTIA_ELEVATION_KEY_FILE=/etc/hestia-broker/elevation.key
+Environment=HOME=/var/lib/hestia-broker
+ExecStart=/usr/bin/python3 /usr/local/lib/hestia/brokerd.py run
+Restart=always
+RestartSec=3
+
+# --- sandbox (extracted verbatim from the proven Part-8 unit) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hestia-spool /var/lib/hestia-broker
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+# NOTE (live-tune): if 'tailscale ssh' or Telegram HTTPS breaks under the sandbox, relax in this order:
+#   drop RestrictNamespaces -> drop ProtectSystem=strict (use =full) -> widen ReadWritePaths. Verify with
+#   'journalctl -u hestia-broker' after start. A stricter SystemCallFilter=@system-service can be added once
+#   confirmed working. IPAddressAllow (Telegram+tailscale only) is a future tightening (Telegram IPs vary).
+
+[Install]
+WantedBy=multi-user.target

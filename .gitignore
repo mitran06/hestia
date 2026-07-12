@@ -1,0 +1,21 @@
+# --- Hestia: never commit site config or secrets ---
+config/hestia.env
+*.env
+!config/hestia.env.example
+broker.env
+
+# secrets / keys
+*.key
+elevation.key
+*.pem
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# editor / os
+*.swp
+*~
+.DS_Store
