@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 mitran06
+Copyright (c) 2026 Mitran Gokulnath
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-SECURITY NOTE: Hestia is a security-sensitive system that mediates an AI agent's
-access to your machines. It is provided "as is" with no warranty. You are
-responsible for reviewing the code, understanding the threat model
-(docs/security-model.md), and operating it safely. Read the code before you run it.
