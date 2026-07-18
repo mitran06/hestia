@@ -40,6 +40,12 @@ def build_request(cwd, argv, elevate):
                  "cwd": cwd, "elevate": bool(elevate), "argv": list(argv)}
 
 
+def build_control(kind, extra):
+    """Build a non-command control op (session_open / session_close). No cwd/argv/elevate."""
+    rid = str(uuid.uuid4())
+    return rid, {"v": 1, "session_id": session_id(), "request_id": rid, "kind": kind, **extra}
+
+
 def submit(req_id, req):
     """Atomic: write <uuid>.tmp then rename to <uuid> so the mover never sees a partial file."""
     body = json.dumps(req).encode("utf-8")
@@ -71,6 +77,38 @@ def wait_result(req_id, timeout):
 
 
 def main(av):
+    if len(av) > 1 and av[1] in ("session-open", "session-close"):
+        args = av[2:]
+        if av[1] == "session-open":
+            intent = None; secs = None; i = 0
+            while i < len(args):
+                a = args[i]
+                if a == "--intent" and i + 1 < len(args): intent = args[i + 1]; i += 2
+                elif a == "--duration" and i + 1 < len(args):
+                    try: secs = int(args[i + 1])
+                    except ValueError: sys.stderr.write("[hestia-relay] --duration must be an integer\n"); return 2
+                    i += 2
+                else: i += 1
+            if intent is None or secs is None:
+                sys.stderr.write("usage: hestia-relay session-open --intent STR --duration SECS\n"); return 2
+            rid, req = build_control("session_open", {"intent": intent, "duration_secs": secs})
+            ok_status = "session_opened"
+        else:
+            rid, req = build_control("session_close", {})
+            ok_status = "session_closed"
+        try:
+            submit(rid, req)
+        except (OSError, ValueError) as e:
+            sys.stderr.write(f"[hestia-relay] submit failed: {e}\n"); return 1
+        sys.stderr.write(f"[hestia-relay] submitted {av[1]} {rid}; awaiting owner…\n")
+        res = wait_result(rid, DEFAULT_TIMEOUT)
+        if res is None:
+            sys.stderr.write("[hestia-relay] TIMEOUT: no result\n"); return 124
+        status = res.get("status")
+        if status == ok_status:
+            return 0
+        sys.stderr.write(f"[hestia-relay] {status}: {res.get('reason', '')}\n")
+        return {"refused": 77, "rejected": 78, "revoked": 75, "timeout": 124, "error": 70}.get(status, 1)
     cwd, elevate, timeout, out_argv = DEFAULT_CWD, False, DEFAULT_TIMEOUT, None
     args = av[1:]; i = 0
     while i < len(args):

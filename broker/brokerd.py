@@ -45,6 +45,8 @@ RESULT_CAP     = 60000                                                # HARD cap
 MAX_INFLIGHT   = int(os.environ.get("HESTIA_MAX_INFLIGHT", "6"))     # concurrent relayed execs cap
 MAX_PENDING    = int(os.environ.get("HESTIA_MAX_PENDING", "20"))     # outstanding approval buttons cap
 SESSION_CMD_BUDGET = int(os.environ.get("HESTIA_SESSION_CMD_BUDGET", "40"))  # commands per open window
+SESSION_LOG_WINDOW  = int(os.environ.get("HESTIA_SESSION_LOG_WINDOW", "20"))   # last-N log lines shown; older rolled up
+SESSION_FLUSH_MIN_S = float(os.environ.get("HESTIA_SESSION_FLUSH_MIN_S", "1")) # min seconds between non-forced edits (coalesce)
 
 # --- shared state (guarded by _lock; workers touch _inflight + write results) ---
 _lock = threading.Lock()
@@ -54,6 +56,19 @@ _session_cmd_count  = 0       # commands consumed in the current window (budget-
 _pending  = {}                # nonce -> dict(kind, req, chash, chat_id, msg_id, deadline)
 _inflight = {}                # exec_token -> dict(req, chash, decision, wo, proc, revoked, started)
 _tg_offset = None
+
+# --- session-render state (Phase A: in-memory; guarded by _lock; lost on restart => fail-closed) ---
+_session_intent   = ""        # trusted anchor of the OPEN window; "" when closed. CANONICAL (sanitized once at
+                              #   intake) so displayed == stored == anchor. Renderer displays it verbatim.
+_session_secs     = 0         # approved duration of the open window (for display)
+_session_msg_id   = None      # the ONE live session message id (reused button msg -> edited in place)
+_session_log      = {}        # request_id -> {"icon":str,"argv":str,"status":str,"kind":str} (insertion-ordered)
+_session_counts   = {"auto": 0, "approved": 0, "elevated": 0, "blocked": 0, "failed": 0}
+_session_phase    = "idle"    # "idle" | "open" | "ended"
+_session_end_reason = ""      # "agent" | "expired" | "revoked"
+_session_killed   = 0         # in-flight execs killed by the terminating revoke (for the ⚪ header)
+_render_dirty     = False     # set by session_log/state changes; consumed by _flush_session_msg
+_session_last_flush = 0.0     # monotonic time of the last edit; enforces the <=1/sec coalescing on non-forced flushes
 
 
 def now(): return time.monotonic()
@@ -77,6 +92,131 @@ def send_button(text, nonce):
 def resolve_msg(chat_id, msg_id, text):
     try: tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=text)
     except Exception: pass
+
+
+def _reset_counts():
+    global _session_counts
+    _session_counts = {"auto": 0, "approved": 0, "elevated": 0, "blocked": 0, "failed": 0}
+
+
+def _end_session(reason, killed=0):
+    """Terminal transition for the open window (agent-close / expiry / revoke). Render the ⚪ summary
+    ONTO the live session message WHILE the log + counts are still populated, invalidate any session-
+    scoped pending approvals, then wipe the window state. _session_msg_id is intentionally KEPT so the
+    already-edited message stays put; a fresh session_open mints a new message. `killed` feeds the
+    ⚪ 'revoked — N killed' header (0 for agent/expired). Main-thread."""
+    global _session_until, _session_until_wall, _session_intent, _session_secs
+    global _session_phase, _session_end_reason, _session_killed
+    if _session_phase == "ended":                  # idempotent: a double-call (expiry then revoke, or a
+        return                                     #   repeated tick) must NOT overwrite the good ⚪ summary
+    _session_phase = "ended"
+    _session_end_reason = reason
+    _session_killed = killed
+    _flush_session_msg(force=True)                 # renders ⚪ from the still-populated log/counts
+    # T10 FULL pending-invalidation: the window just closed, so EVERY outstanding pending is a stale
+    # button that must NEVER dispatch into the closed window. Invalidate ALL of them — commands/elevated
+    # via refuse() (with their chash), control ops (session_open re-anchor / session_close) via
+    # _control_refuse(). A pending whose msg_id IS the live session message (a re-anchor sharing it) is
+    # still refused + dropped, but its button is NOT re-edited (that would clobber the ⚪ summary just
+    # rendered). Note revoke_all() pre-clears _pending, so this loop is a no-op there (no double-refuse).
+    stale = list(_pending.items())
+    _pending.clear()
+    for nonce, p in stale:
+        if p.get("msg_id") != _session_msg_id:                 # own button -> mark it dead; keep the ⚪ summary intact
+            resolve_msg(p["chat_id"], p["msg_id"], "⌛ session ended")
+        if p["kind"] in ("session_open", "session_close"):
+            _control_refuse(p["req"], "session ended")
+        else:
+            refuse(p["req"], p["chash"], "session ended")
+    broker.audit({"decision": "SESSION_PENDING_INVALIDATED", "count": len(stale), "reason": reason})
+    _session_until = 0.0
+    _session_until_wall = 0.0
+    _session_intent = ""
+    _session_secs = 0
+    _session_log.clear()
+    _reset_counts()
+    # NOTE: _session_msg_id is deliberately NOT reset — the edited message must remain.
+
+
+def _hhmm(wall):
+    """HH:MM (local) of a wall-clock deadline, for the 'expires HH:MM' header. 0/None -> '--:--'."""
+    if not wall:
+        return "--:--"
+    return time.strftime("%H:%M", time.localtime(wall))
+
+
+def _render_session():
+    """Pure render of the session message from state (no I/O). Two shapes:
+      open  -> 🟢 header + enforcing-intent + divider + (windowed) log lines.
+      ended -> ⚪ summary header (reason + total cmds + counts) + the (windowed) log below.
+    The intent is rendered VERBATIM from the (already-canonical) _session_intent — no re-sanitize,
+    no re-truncate — so displayed == stored == anchor. Guaranteed < 4000 chars (Telegram hard-caps
+    message text at 4096).
+    Thread safety: SNAPSHOTS all shared state under _lock at the top, then renders from locals only,
+    so a concurrent session_log() insert (up to MAX_INFLIGHT worker threads, also under _lock) can
+    never mutate what we iterate — no `dictionary changed size during iteration`. VERIFIED: no caller
+    (_flush_session_msg, on_deny) holds _lock, so this acquisition cannot deadlock (_lock is non-
+    reentrant); revoke_all releases _lock before reaching _end_session -> _flush -> here."""
+    with _lock:
+        entries = list(_session_log.values())    # insertion-ordered snapshot (iteration is off the live dict)
+        counts  = dict(_session_counts)
+        phase   = _session_phase
+        intent  = _session_intent
+        end_reason  = _session_end_reason
+        killed  = _session_killed
+        until_wall  = _session_until_wall
+    total = len(entries)
+    shown = entries[-SESSION_LOG_WINDOW:] if total > SESSION_LOG_WINDOW else entries
+    hidden = total - len(shown)
+    body = []
+    if hidden > 0:
+        c = counts
+        body.append("…%d earlier · %d auto · %d approved · %d elevated · %d blocked · %d failed"
+                    % (hidden, c["auto"], c["approved"], c["elevated"], c["blocked"], c["failed"]))
+    for e in shown:
+        body.append(e["icon"] + "  " + e["argv"] + "   " + e["status"])
+
+    if phase == "open":
+        head = ["🟢 Session open · expires " + _hhmm(until_wall),
+                'enforcing: "' + intent + '"',     # verbatim canonical anchor
+                "────────"]
+    else:   # "ended" (or defensive fallback)
+        c = counts
+        reason = {"agent": "ended by agent",
+                  "expired": "expired",
+                  "revoked": "revoked — %d killed" % killed}.get(end_reason, "ended")
+        summary = "%d auto · %d approved · %d elevated · %d blocked · %d failed" % (
+            c["auto"], c["approved"], c["elevated"], c["blocked"], c["failed"])
+        head = ["⚪ Session " + reason + " · " + str(total) + " cmds · " + summary,
+                "────────"]
+
+    text = "\n".join(head + body)
+    while len(text) > 3900 and body:             # hard guard: drop oldest shown lines until it fits < 4000
+        body.pop(0)
+        text = "\n".join(head + body)
+    return text[:3999]
+
+
+def _flush_session_msg(force=False):
+    """Edit the ONE live session message to the current render. No-op unless dirty (or forced).
+    Non-forced edits are coalesced to at most ~1/sec (SESSION_FLUSH_MIN_S) via a min-interval guard;
+    force=True is exempt so terminal/open/close edits always land. When the session is open, re-attaches
+    the 🛑 Revoke inline keyboard after the text edit."""
+    global _render_dirty, _session_last_flush
+    if not force and not _render_dirty:
+        return
+    if not force and (now() - _session_last_flush) < SESSION_FLUSH_MIN_S:
+        return                                              # coalesce: at most ~1 edit/sec on non-forced flushes
+    if _session_msg_id is not None:
+        resolve_msg(OWNER_ID, _session_msg_id, _render_session())
+        if _session_phase == "open":                        # ride the Revoke button on the live session message
+            try:
+                tg("editMessageReplyMarkup", chat_id=OWNER_ID, message_id=_session_msg_id,
+                   reply_markup={"inline_keyboard": [[{"text": "🛑 Revoke session", "callback_data": "REVOKE"}]]})
+            except Exception:
+                pass
+        _session_last_flush = now()                         # monotonic stamp: NTP-step-safe throttle
+    _render_dirty = False
 
 
 def session_open(): return now() < _session_until and time.time() < _session_until_wall
@@ -213,6 +353,52 @@ def _fmt(req, chash, kind):
     return f"{head}\n\n  cwd: {cwd}\n  cmd: {cmd}\n  hash: {chash[:16]}…\n{note}\n\nApprove?"
 
 
+def _canon_intent(intent):
+    """Canonicalize the agent-proposed intent ONCE, at intake: sanitize control chars and cap length.
+    The RESULT is the single canonical string used everywhere — shown on the 🟡 button, promoted to
+    the trusted anchor _session_intent on approval, and rendered verbatim in the 🟢/⚪ header. This is
+    what makes displayed == stored == anchor hold (decision ④)."""
+    return _san(str(intent))[:broker.MAX_INTENT]        # == 500; single source of truth (no silent divergence)
+
+
+def _fmt_session_open(intent, secs):
+    # yellow session-request text. `intent` is ALREADY canonical (_canon_intent ran at intake) -> render as-is.
+    return ("🟡 The agent requests a work session\n"
+            "what: " + intent + "\n"
+            "for:  " + str(secs // 60) + " min\n\n"
+            "Approve?")
+
+
+def session_log(request_id, icon, argv, status, kind="command"):
+    """Record/UPDATE one command's outcome in the live session log, keyed by request_id so concurrent
+    workers (MAX_INFLIGHT) update THEIR row in place — never duplicate, never reorder. Drops appends
+    outside an open window (pre/post-session noise). Bumps the right _session_counts on a terminal
+    status exactly once. Marks the render dirty for the next _flush_session_msg."""
+    global _render_dirty
+    with _lock:
+        if _session_phase != "open":
+            return
+        prev = _session_log.get(request_id)
+        kept_kind = prev["kind"] if prev else kind            # keep the ORIGINAL scope kind across updates
+        _session_log[request_id] = {"icon": icon, "argv": _san(str(argv))[:80],
+                                    "status": status, "kind": kept_kind}
+        # terminality/bucketing keys on the ICON (the canonical per-site signal) so free-form refuse/
+        # rejected statuses ("refused: …" / "rejected") still count correctly; 'revoked' is terminal-
+        # for-dedup but intentionally UNCOUNTED regardless of its (rc-derived) icon.
+        revoked = status == "revoked"
+        terminal = revoked or icon in ("✓", "✗", "⛔", "🚫", "⏱", "⌛")
+        already = bool(prev) and prev.get("_counted")
+        _session_log[request_id]["_counted"] = already or terminal
+        if terminal and not already and not revoked:
+            if icon in ("✗", "⏱"):                            # ran-and-failed OR exec-timeout
+                _session_counts["failed"] += 1
+            elif icon in ("⛔", "🚫", "⌛"):                   # denied / refused / approval-timed-out (never ran)
+                _session_counts["blocked"] += 1
+            elif icon == "✓" and kept_kind in ("auto", "approved", "elevated"):
+                _session_counts[kept_kind] += 1
+        _render_dirty = True
+
+
 def dispatch(req, chash, decision, elevated=False):
     """NON-BLOCKING. Binding-check in the caller thread, then run the relay in a WORKER thread so the
     control plane keeps polling Telegram + honoring revoke/expiry (a slow exec cannot stall approvals).
@@ -242,7 +428,10 @@ def dispatch(req, chash, decision, elevated=False):
                                 "elevated": elevated, "proc": None, "revoked": False, "started": now()}
     if capped:
         broker.audit({"decision": "REFUSED", "reason": "inflight cap", "request_id": req["request_id"]})
+        session_log(req["request_id"], "🚫", req["argv"], "refused: too many concurrent commands")
         write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused", "reason": "too many concurrent commands"}); return
+    _k = "elevated" if elevated else ("auto" if wo else "approved")
+    session_log(req["request_id"], "🔴" if elevated else "⏳", req["argv"], "running", kind=_k)
     threading.Thread(target=_run_exec, args=(token,), daemon=True).start()
 
 
@@ -261,6 +450,7 @@ def _run_exec(token):
                                    "cwd": req["cwd"], "run_as": ELEV_RUNAS, "argv": req["argv"], "exec_token": token})
             if not ticket:
                 with _lock: _inflight.pop(token, None)
+                session_log(req["request_id"], "🚫", req["argv"], "refused: elevation not configured")
                 write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused",
                                                  "reason": "elevation not configured (no key)"}); return
             cmd = [TAILSCALE, "ssh", TARGET, "--", "sudo", "-n", ELEV_WRAPPER, "run", ticket]
@@ -288,9 +478,16 @@ def _run_exec(token):
             info = _inflight.get(token)
             revoked = revoked_early or bool(info and info.get("revoked"))
         status, reason = ("revoked" if revoked else ("timeout" if rc == 124 else "executed")), None
+        if status == "revoked":      _log_status = "revoked"
+        elif status == "timeout":    _log_status = "⏱ timeout"
+        elif rc == 0:                _log_status = "✓ exit0"
+        else:                        _log_status = "✗ exit%d" % rc
+        session_log(req["request_id"], ("⏱" if rc == 124 else ("✓" if rc == 0 else "✗")),
+                    req["argv"], _log_status)
     except Exception as e:
         broker.audit({"decision": "WORKER_ERROR", "err": repr(e), "request_id": req["request_id"]})
         status, reason = "error", "worker error (spawn/exec failed)"
+        session_log(req["request_id"], "✗", req["argv"], "✗ error")     # terminal: crashed worker counts as failed
     finally:
         with _lock: _inflight.pop(token, None)               # ALWAYS free the slot (no leak -> no wedge)
     out = out_b[:MAXOUT].decode("utf-8", "replace"); err = err_b[:4096].decode("utf-8", "replace")
@@ -311,13 +508,13 @@ def revoke_all(reason="revoked by owner"):
     """Owner /panic or Revoke button: close the session, KILL every in-flight exec (local + target process-
     group kill), and deny all pending approvals. Main-thread only."""
     global _session_until, _session_until_wall
-    _session_until = 0.0; _session_until_wall = 0.0
     with _lock:
         tokens = list(_inflight.keys())
         for t in tokens: _inflight[t]["revoked"] = True
         procs = [(t, _inflight[t].get("proc"), _inflight[t].get("elevated", False)) for t in tokens]
+    killed = len(procs)                                        # captured BEFORE _end_session clears; feeds the ⚪ header
     pend = list(_pending.items()); _pending.clear()
-    broker.audit({"decision": "REVOKE", "reason": reason, "inflight": len(procs), "pending": len(pend)})
+    broker.audit({"decision": "REVOKE", "reason": reason, "inflight": killed, "pending": len(pend)})
     for t, proc, elev in procs:
         if proc:
             try: proc.kill()
@@ -325,20 +522,20 @@ def revoke_all(reason="revoked by owner"):
         threading.Thread(target=_do_remote_kill, args=(t, elev), daemon=True).start()   # elevated-aware, off the main loop
     for nonce, p in pend:
         resolve_msg(p["chat_id"], p["msg_id"], "🛑 Revoked.")
-        refuse(p["req"], p["chash"], reason)
-
-
-def _send_revoke_control():
-    try:
-        tg("sendMessage", chat_id=OWNER_ID, text="Session is OPEN. Tap to STOP everything (or send /panic):",
-           reply_markup={"inline_keyboard": [[{"text": "🛑 Revoke session", "callback_data": "REVOKE"}]]})
-    except Exception:
-        pass
+        if p["kind"] in ("session_open", "session_close"):
+            _control_refuse(p["req"], reason)
+        else:
+            refuse(p["req"], p["chash"], reason)
+    if _session_phase == "open":                              # only render/close a window that was actually open
+        _end_session("revoked", killed=killed)                # renders ⚪ 'revoked — N killed' from live counts/log, then clears
+    else:
+        _session_until = _session_until_wall = 0.0            # defensive: ensure closed even with no open window
 
 
 def refuse(req, chash, reason):
     broker.audit({"decision": "REFUSED", "reason": reason, "cmd_hash": chash,
                   "request_id": req["request_id"], "argv": req.get("argv")})
+    session_log(req["request_id"], "🚫", req.get("argv"), "refused: " + _san(str(reason))[:60])
     write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused", "reason": reason})
 
 
@@ -358,18 +555,85 @@ def _ask(kind, req, decision, chash, secs):
         return
     _pending[nonce] = {"kind": kind, "req": req, "chash": chash, "decision": decision,
                        "chat_id": OWNER_ID, "msg_id": mid, "deadline": now() + secs}
+    if kind in ("command", "elevated"):                        # scope kind for the 🔵 awaiting row
+        session_log(req["request_id"], "🔵", req.get("argv"), "🔵 awaiting your tap",
+                    kind=("elevated" if kind == "elevated" else "approved"))
+
+
+def _control_refuse(req, reason):
+    """Refuse a CONTROL op (session_open/close) — like refuse() but writes NO cmd_hash (control ops
+    are never classified/hashed). Always leaves the box a valid result."""
+    broker.audit({"decision": "REFUSED", "reason": reason, "request_id": req["request_id"],
+                  "kind": req.get("kind")})
+    write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused", "reason": reason})
+
+
+def _ask_session(req, intent, secs, msg_id=None):
+    """Send/EDIT the 🟡 session-open button + register a session_open pending nonce. `intent` MUST already
+    be canonical (_canon_intent applied by the caller at intake). msg_id=None -> fresh send_button; msg_id
+    set (T10 re-anchor) -> edit the live session message in place. On any send failure or pending-cap hit,
+    control-refuse (never a dangling request)."""
+    nonce = secrets.token_urlsafe(18)
+    if msg_id is None:
+        try:
+            mid = send_button(_fmt_session_open(intent, secs), nonce)
+        except Exception as e:
+            mid = None; broker.audit({"decision": "SEND_FAIL", "err": str(e), "request_id": req["request_id"]})
+    else:
+        mid = msg_id                                   # T10 re-anchor edits the live message IN PLACE; keep its id
+        kb = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": nonce + ":A"},
+                                   {"text": "⛔ Deny",    "callback_data": nonce + ":D"}]]}
+        try: tg("editMessageText", chat_id=OWNER_ID, message_id=mid,
+                text=_fmt_session_open(intent, secs), reply_markup=kb)   # repaint 🟢 -> 🟡 re-anchor prompt, fresh nonce
+        except Exception: pass
+    if len(_pending) >= MAX_PENDING or mid is None:
+        broker.audit({"decision": "REFUSED", "reason": "pending cap or send fail",
+                      "request_id": req["request_id"], "kind": "session_open"})
+        _control_refuse(req, "could not deliver session button")
+        return
+    _pending[nonce] = {"kind": "session_open", "req": req, "intent": intent, "secs": secs,
+                       "chat_id": OWNER_ID, "msg_id": mid, "deadline": now() + SESSION_ASK_SECS}
+
+
+def _handle_session_open(req):
+    """Route a validated session_open control op. Canonicalize the agent-proposed intent ONCE here, then:
+    if a window is already open, re-anchor (T10 rewrites this branch); else ask the owner to approve the
+    canonical intent/duration."""
+    intent = _canon_intent(req["intent"])              # THE one sanitize+cap; anchor==display from here on
+    if session_open():
+        # re-anchor: re-prompt over the live session message; the OLD window keeps enforcing the OLD
+        # intent until the owner re-approves. The anchor is NOT mutated here (only on_approve swaps it).
+        broker.audit({"decision": "SESSION_REANCHOR", "old_intent": _session_intent,
+                      "new_intent": intent, "request_id": req["request_id"]})
+        _ask_session(req, intent, int(req["duration_secs"]), msg_id=_session_msg_id)
+        return
+    _ask_session(req, intent, int(req["duration_secs"]))
+
+
+def _handle_session_close(req):
+    """Agent asks to close the current window. If open -> end it (⚪ ended-by-agent) and ack; if there is
+    no open session, still ack idempotently so the box never blocks (with a reason for observability)."""
+    if session_open():
+        _end_session("agent")
+        write_result(req["request_id"], {"request_id": req["request_id"], "status": "session_closed"})
+    else:
+        write_result(req["request_id"], {"request_id": req["request_id"],
+                                         "status": "session_closed", "reason": "no open session"})
 
 
 def process(req, decision, chash):
     """Route a validated request. Sends buttons / executes / refuses. (main thread)"""
     global _session_cmd_count
     if not session_open():
-        _ask("session", req, decision, chash, SESSION_ASK_SECS)
+        broker.audit({"decision": "REFUSED", "reason": "no open session", "request_id": req["request_id"]})
+        write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused",
+                                         "reason": "no open session — run session-open first"})
         return
     _session_cmd_count += 1
     if _session_cmd_count > SESSION_CMD_BUDGET:             # bound total activity per open window
         broker.audit({"decision": "REFUSED", "reason": "session command budget exceeded",
                       "count": _session_cmd_count, "request_id": req["request_id"]})
+        session_log(req["request_id"], "🚫", req["argv"], "refused: budget exceeded")
         write_result(req["request_id"], {"request_id": req["request_id"], "status": "refused",
                                          "reason": "session command budget exceeded (open a new session)"})
         return
@@ -387,15 +651,22 @@ def process(req, decision, chash):
 
 def on_approve(p):
     global _session_until, _session_until_wall, _session_cmd_count
-    if p["kind"] == "session":
-        _session_until = now() + SESSION_SECS                  # monotonic AND wall-clock deadlines
-        _session_until_wall = time.time() + SESSION_SECS
-        _session_cmd_count = 0                                  # fresh command budget for the new window
-        broker.audit({"decision": "SESSION_OPENED", "secs": SESSION_SECS, "by": OWNER_ID})
-        resolve_msg(p["chat_id"], p["msg_id"], f"✅ Session opened ({SESSION_SECS//60} min). Processing…")
-        _send_revoke_control()
-        process(p["req"], p["decision"], p["chash"])           # re-route the triggering command
-    elif p["kind"] == "elevated":
+    global _session_intent, _session_secs, _session_phase, _session_msg_id
+    if p["kind"] == "session_open":
+        _session_until      = now() + p["secs"]                 # BOTH clocks to the APPROVED duration
+        _session_until_wall = time.time() + p["secs"]
+        _session_cmd_count  = 0
+        _session_intent     = p["intent"]                       # trusted anchor == canonical == button text
+        _session_secs       = p["secs"]
+        _session_log.clear(); _reset_counts()
+        _session_phase      = "open"
+        _session_msg_id     = p["msg_id"]                       # REUSE the button msg -> edit in place
+        broker.audit({"decision": "SESSION_OPENED", "secs": p["secs"], "intent": p["intent"], "by": OWNER_ID})
+        _flush_session_msg(force=True)                          # synchronous edit: 🟡 button -> 🟢 session
+        write_result(p["req"]["request_id"],
+                     {"request_id": p["req"]["request_id"], "status": "session_opened", "secs": p["secs"]})
+        return
+    if p["kind"] == "elevated":
         resolve_msg(p["chat_id"], p["msg_id"], f"✅ ELEVATED approved — running as {ELEV_RUNAS}…")
         dispatch(p["req"], p["chash"], p["decision"], elevated=True)
     else:
@@ -404,8 +675,25 @@ def on_approve(p):
 
 
 def on_deny(p):
+    if p["kind"] == "session_open":
+        # denied session_open. If a window is still open, this was a RE-ANCHOR — the OLD window survives
+        # unchanged, so revert the live message to the 🟢 open render (intent anchor untouched). If no
+        # window is open, it was a first-open denial -> a plain refusal edit. Either way: refused result.
+        if session_open():
+            resolve_msg(p["chat_id"], p["msg_id"], _render_session())
+            _flush_session_msg(force=True)                     # re-attach the 🛑 Revoke keyboard (T9)
+        else:
+            resolve_msg(p["chat_id"], p["msg_id"], "⛔ Session denied.")
+        broker.audit({"decision": "SESSION_DENIED", "request_id": p["req"]["request_id"]})
+        write_result(p["req"]["request_id"], {"request_id": p["req"]["request_id"],
+                                              "status": "refused", "reason": "owner denied session"})
+        return
     resolve_msg(p["chat_id"], p["msg_id"], "⛔ Denied.")
+    if p["kind"] == "session_close":                            # control op, no chash
+        _control_refuse(p["req"], "owner denied")
+        return
     refuse(p["req"], p["chash"], "owner denied")
+    session_log(p["req"]["request_id"], "⛔", p["req"].get("argv"), "⛔ denied")
 
 
 def poll_telegram():
@@ -430,18 +718,18 @@ def poll_telegram():
         cq = u.get("callback_query")
         if not cq: continue
         if cq.get("from", {}).get("id") != OWNER_ID:           # OWNER-ONLY: checked before any state change
-            try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="not authorized")
+            try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="")
             except Exception: pass
             broker.audit({"decision": "CALLBACK_DROPPED", "reason": "non-owner", "from": cq.get("from", {}).get("id")})
             continue
         data = cq.get("data", "")
         if data == "REVOKE":                                   # persistent revoke button
-            try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="revoked")
+            try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="")
             except Exception: pass
             revoke_all("owner revoke button"); continue
         nonce, _, act = data.rpartition(":")
         p = _pending.pop(nonce, None)                          # compare-and-set: single use (main-thread only)
-        try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="ok" if p else "already handled")
+        try: tg("answerCallbackQuery", callback_query_id=cq["id"], text="")
         except Exception: pass
         if not p: continue
         (on_approve if act == "A" else on_deny)(p)
@@ -453,11 +741,15 @@ def check_expiries():
     for nonce in [k for k, p in _pending.items() if t > p["deadline"]]:
         p = _pending.pop(nonce)
         resolve_msg(p["chat_id"], p["msg_id"], "⌛ Timed out — auto-denied.")
-        refuse(p["req"], p["chash"], "approval timeout (auto-deny)")
+        if p["kind"] in ("session_open", "session_close"):
+            _control_refuse(p["req"], "approval timeout (auto-deny)")
+        else:
+            refuse(p["req"], p["chash"], "approval timeout (auto-deny)")
+            session_log(p["req"]["request_id"], "⌛", p["req"].get("argv"), "⌛ approval timeout")
     # close the session at the EARLIER of the monotonic or wall-clock deadline (NTP step-forward safe)
     if (_session_until and t > _session_until) or (_session_until_wall and time.time() > _session_until_wall):
-        _session_until = 0.0; _session_until_wall = 0.0
         broker.audit({"decision": "SESSION_CLOSED", "reason": "expired"})
+        _end_session("expired")                                # renders ⚪ summary, then clears clocks/intent/log/counts
 
 
 def scan_incoming():
@@ -476,7 +768,15 @@ def scan_incoming():
             req = broker.validate_request(raw, name)
         except broker.Reject as e:
             broker.audit({"decision": "REJECT", "reason": str(e), "request_id": name})
+            session_log(name, "🚫", "(malformed)", "rejected")
             write_result(name, {"request_id": name, "status": "rejected", "reason": str(e)})
+            continue
+        kind = req.get("kind", "command")
+        if kind == "session_open":
+            _handle_session_open(req)                           # never classified/hashed
+            continue
+        if kind == "session_close":
+            _handle_session_close(req)                          # T6 completes this handler
             continue
         chash = broker.cmd_hash(req)
         decision, reason = broker.classify(req)
@@ -491,7 +791,7 @@ def run_daemon():
     broker.audit({"decision": "BROKER_START", "owner": OWNER_ID, "target": TARGET})
     while True:
         try:
-            poll_telegram(); scan_incoming(); check_expiries()
+            poll_telegram(); scan_incoming(); check_expiries(); _flush_session_msg()
         except Exception as e:                               # a transient error must NOT kill the only approval path
             broker.audit({"decision": "LOOP_ERROR", "err": repr(e)})
         time.sleep(0.5)                                       # floor: avoid busy-loop on persistent fast-return

@@ -50,5 +50,79 @@ try:
 except ValueError:
     ck("oversize rejected", True)
 
+print("== build_control: session_open shape ==")
+oid, oreq = R.build_control("session_open", {"intent": "deploy the site", "duration_secs": 1800})
+ck("session_open kind set", oreq.get("kind") == "session_open")
+ck("session_open carries intent", oreq.get("intent") == "deploy the site")
+ck("session_open carries duration_secs (int)", oreq.get("duration_secs") == 1800 and isinstance(oreq["duration_secs"], int))
+ck("session_open request_id is a uuid matching rid", R.uuid.UUID(oid) and oreq["request_id"] == oid)
+ck("session_open exact schema", set(oreq) == {"v", "session_id", "request_id", "kind", "intent", "duration_secs"})
+ck("session_open v==1", oreq["v"] == 1)
+ck("session_open reuses stable session_id", oreq["session_id"] == req["session_id"])
+
+print("== build_control: session_close shape ==")
+cid, creq = R.build_control("session_close", {})
+ck("session_close kind set", creq.get("kind") == "session_close")
+ck("session_close exact schema (no extra)", set(creq) == {"v", "session_id", "request_id", "kind"})
+ck("session_close request_id matches", creq["request_id"] == cid)
+
+print("== main() session-open / session-close exit-code mapping ==")
+_orig_build_control = R.build_control
+def _spy_build_control(kind, extra):
+    rid, req = _orig_build_control(kind, extra)
+    _spy_build_control.last_rid = rid
+    _spy_build_control.last_req = req
+    return rid, req
+
+def run_control(av, broker_result):
+    """Run R.main(av) while a thread delivers broker_result (keyed to the generated rid) to the inbox."""
+    R.build_control = _spy_build_control
+    _spy_build_control.last_rid = None
+    ready = threading.Event()
+    def deliver():
+        for _ in range(200):
+            if _spy_build_control.last_rid is not None:
+                break
+            time.sleep(0.02)
+        rid = _spy_build_control.last_rid
+        if broker_result is not None and rid is not None:
+            res = dict(broker_result); res["request_id"] = rid
+            with open(os.path.join(IN, rid), "w") as f:
+                json.dump(res, f)
+        ready.set()
+    th = threading.Thread(target=deliver, daemon=True); th.start()
+    try:
+        rc = R.main(av)
+    finally:
+        ready.wait(3); th.join(3); R.build_control = _orig_build_control
+    return rc
+
+rc = run_control(["hestia-relay", "session-open", "--intent", "deploy", "--duration", "1800"],
+                 {"status": "session_opened", "secs": 1800})
+ck("session-open approved -> 0", rc == 0)
+ck("session-open sent kind session_open", _spy_build_control.last_req["kind"] == "session_open")
+ck("session-open sent intent/duration", _spy_build_control.last_req["intent"] == "deploy" and _spy_build_control.last_req["duration_secs"] == 1800)
+
+rc = run_control(["hestia-relay", "session-open", "--intent", "deploy", "--duration", "1800"],
+                 {"status": "refused", "reason": "denied by owner"})
+ck("session-open refused -> 77", rc == 77)
+
+rc = run_control(["hestia-relay", "session-open", "--intent", "deploy", "--duration", "1800"], None)
+ck("session-open no-result (timeout) -> 124", rc == 124)
+
+rc = R.main(["hestia-relay", "session-open", "--duration", "1800"])
+ck("session-open missing --intent -> 2", rc == 2)
+rc = R.main(["hestia-relay", "session-open", "--intent", "deploy"])
+ck("session-open missing --duration -> 2", rc == 2)
+rc = R.main(["hestia-relay", "session-open", "--intent", "deploy", "--duration", "notanint"])
+ck("session-open non-int --duration -> 2", rc == 2)
+
+rc = run_control(["hestia-relay", "session-close"], {"status": "session_closed"})
+ck("session-close closed -> 0", rc == 0)
+ck("session-close sent kind session_close", _spy_build_control.last_req["kind"] == "session_close")
+
+rc = run_control(["hestia-relay", "session-close"], None)
+ck("session-close no-result (timeout) -> 124", rc == 124)
+
 print(f"\nRESULT: {npass} passed, {nfail} failed")
 sys.exit(0 if nfail == 0 else 1)

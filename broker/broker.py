@@ -23,6 +23,7 @@ MAXSIZE        = 65536                     # 64 KiB, matches the mover cap
 SCHEMA_VERSION = 1
 MAX_ARGV       = 256                       # cap argv length
 MAX_ARG_LEN    = 8192                      # cap a single arg
+MAX_INTENT     = 500                       # cap session intent text (there is NO duration ceiling)
 AUDIT_LOG      = os.environ.get("HESTIA_AUDIT", "/var/lib/hestia-broker/log/audit.log")
 UUID_RE        = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -68,8 +69,33 @@ class Reject(Exception):
     """Raised for malformed/hostile input that fails schema validation."""
 
 
+def _reject_keys(req: dict, allowed: set):
+    """Raise Reject if req has any key outside `allowed` OR is missing any key in `allowed`."""
+    keys = set(req)
+    extra = keys - allowed
+    if extra:
+        raise Reject(f"unexpected keys: {sorted(extra)}")
+    if keys != allowed:
+        raise Reject(f"missing keys: {sorted(allowed - keys)}")
+
+
+def _check_ids(req: dict, expected_id):
+    """Shared identity checks: schema version, UUID ids, anti-swap against the filename id."""
+    if req["v"] != SCHEMA_VERSION:
+        raise Reject(f"bad schema version {req['v']!r}")
+    for k in ("session_id", "request_id"):
+        if not isinstance(req[k], str) or not UUID_RE.match(req[k]):
+            raise Reject(f"{k} is not a UUID")
+    if expected_id is not None and req["request_id"] != expected_id:
+        raise Reject(f"request_id {req['request_id']} != filename {expected_id} (anti-swap)")
+
+
 def validate_request(raw: bytes, expected_id):
-    """Parse + strictly validate the request bytes. Returns the request dict or raises Reject."""
+    """Parse + strictly validate the request bytes. Returns the request dict or raises Reject.
+
+    Dispatches on req['kind']: absent/'command' -> command schema; 'session_open' / 'session_close'
+    -> control schemas. classify/cmd_hash are NEVER run on control ops (brokerd routes them first).
+    """
     if len(raw) > MAXSIZE:
         raise Reject(f"oversize request ({len(raw)} > {MAXSIZE})")
     try:
@@ -79,35 +105,50 @@ def validate_request(raw: bytes, expected_id):
     if not isinstance(req, dict):
         raise Reject("top-level JSON is not an object")
 
-    allowed = {"v", "session_id", "request_id", "cwd", "elevate", "argv"}
-    extra = set(req) - allowed
-    if extra:
-        raise Reject(f"unexpected keys: {sorted(extra)}")
-    if set(req) != allowed:
-        raise Reject(f"missing keys: {sorted(allowed - set(req))}")
+    kind = req.get("kind", "command")
+    if kind == "command":
+        allowed = {"v", "session_id", "request_id", "cwd", "elevate", "argv"}
+        if "kind" in req:
+            allowed.add("kind")            # kind is optional for commands; == "command" here
+        _reject_keys(req, allowed)
+        _check_ids(req, expected_id)
+        if not isinstance(req["cwd"], str) or "\x00" in req["cwd"] or not req["cwd"].startswith("/"):
+            raise Reject("cwd must be an absolute NUL-free string")
+        if not isinstance(req["elevate"], bool):
+            raise Reject("elevate must be a boolean")
+        argv = req["argv"]
+        if not isinstance(argv, list) or not argv or len(argv) > MAX_ARGV:
+            raise Reject("argv must be a non-empty list within length cap")
+        for a in argv:
+            if not isinstance(a, str):
+                raise Reject("argv entries must be strings")
+            if "\x00" in a:
+                raise Reject("argv entry contains NUL")
+            if len(a) > MAX_ARG_LEN:
+                raise Reject("argv entry too long")
+        return req
 
-    if req["v"] != SCHEMA_VERSION:
-        raise Reject(f"bad schema version {req['v']!r}")
-    for k in ("session_id", "request_id"):
-        if not isinstance(req[k], str) or not UUID_RE.match(req[k]):
-            raise Reject(f"{k} is not a UUID")
-    if expected_id is not None and req["request_id"] != expected_id:
-        raise Reject(f"request_id {req['request_id']} != filename {expected_id} (anti-swap)")
-    if not isinstance(req["cwd"], str) or "\x00" in req["cwd"] or not req["cwd"].startswith("/"):
-        raise Reject("cwd must be an absolute NUL-free string")
-    if not isinstance(req["elevate"], bool):
-        raise Reject("elevate must be a boolean")
-    argv = req["argv"]
-    if not isinstance(argv, list) or not argv or len(argv) > MAX_ARGV:
-        raise Reject("argv must be a non-empty list within length cap")
-    for a in argv:
-        if not isinstance(a, str):
-            raise Reject("argv entries must be strings")
-        if "\x00" in a:
-            raise Reject("argv entry contains NUL")
-        if len(a) > MAX_ARG_LEN:
-            raise Reject("argv entry too long")
-    return req
+    if kind == "session_open":
+        _reject_keys(req, {"v", "session_id", "request_id", "kind", "intent", "duration_secs"})
+        _check_ids(req, expected_id)
+        intent = req["intent"]
+        if not isinstance(intent, str) or not (1 <= len(intent) <= MAX_INTENT):
+            raise Reject(f"intent must be a str of length 1..{MAX_INTENT}")
+        if "\x00" in intent:
+            raise Reject("intent contains NUL")
+        d = req["duration_secs"]
+        if isinstance(d, bool) or not isinstance(d, int):
+            raise Reject("duration_secs must be an int")
+        if d < 1:                                   # positive only; NO upper bound (expiry+Revoke are the backstop)
+            raise Reject("duration_secs must be a positive int (>= 1)")
+        return req
+
+    if kind == "session_close":
+        _reject_keys(req, {"v", "session_id", "request_id", "kind"})
+        _check_ids(req, expected_id)
+        return req
+
+    raise Reject(f"unknown kind {kind!r}")
 
 
 def _lp(b: bytes) -> bytes:

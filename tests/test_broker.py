@@ -94,5 +94,60 @@ check("cwd change -> new hash", h(req(cwd="/srv/projects")) != h(req(cwd="/srv/p
 check("elevate change -> new hash", h(req(elevate=False)) != h(req(elevate=True)), True)
 check("session_id change -> new hash", h(req(session_id=SID)) != h(req(session_id=RID)), True)
 
+print("== control ops (session_open / session_close) ==")
+def sopen(**kw):
+    base = {"v": 1, "session_id": SID, "request_id": RID, "kind": "session_open",
+            "intent": "run the test suite", "duration_secs": 1800}
+    base.update(kw); return base
+def sclose(**kw):
+    base = {"v": 1, "session_id": SID, "request_id": RID, "kind": "session_close"}
+    base.update(kw); return base
+def vok(name, r):
+    global npass, nfail
+    try:
+        out = broker.validate_request(json.dumps(r).encode(), r["request_id"])
+        if out == r: npass += 1; print(f"  PASS: {name} -> accepted+echoed")
+        else: nfail += 1; print(f"  FAIL: {name}: echo mismatch got {out!r}")
+    except broker.Reject as e:
+        nfail += 1; print(f"  FAIL: {name}: unexpected REJECT ({e})")
+
+# --- accepted + echoed ---
+vok("session_open valid", sopen())
+vok("session_open intent len 1", sopen(intent="x"))
+vok("session_open intent len 500", sopen(intent="a"*500))
+vok("session_open dur 1", sopen(duration_secs=1))
+vok("session_open dur 86400", sopen(duration_secs=86400))
+vok("session_open dur above 24h (no ceiling)", sopen(duration_secs=100000))
+vok("session_close valid", sclose())
+vok("plain command still validates", req(argv=["ls","-la"]))
+vok("command with kind:command still validates", {**req(argv=["ls"]), "kind": "command"})
+
+# --- session_open rejects ---
+vrej("intent empty", sopen(intent=""))
+vrej("intent 501 chars", sopen(intent="a"*501))
+vrej("intent has NUL", sopen(intent="a\x00b"))
+vrej("intent non-str", sopen(intent=5))
+vrej("dur 0", sopen(duration_secs=0))
+vrej("dur negative", sopen(duration_secs=-1))
+vrej("dur bool true", sopen(duration_secs=True))
+vrej("dur str '5'", sopen(duration_secs="5"))
+vrej("session_open missing intent", {k:v for k,v in sopen().items() if k!="intent"})
+vrej("session_open missing duration", {k:v for k,v in sopen().items() if k!="duration_secs"})
+vrej("session_open extra key", {**sopen(), "argv":["ls"]})
+vrej("session_open bad version", sopen(v=2))
+vrej("session_open non-uuid rid", {**sopen(), "request_id":"nope"})
+vrej("session_open anti-swap", sopen(), eid="33333333-3333-4333-8333-333333333333")
+
+# --- session_close rejects ---
+vrej("session_close extra key (intent)", {**sclose(), "intent":"x"})
+vrej("session_close missing kind treated as command", {k:v for k,v in sclose().items() if k!="kind"})
+vrej("session_close bad version", sclose(v=2))
+
+# --- unknown kind ---
+vrej("unknown kind", {**req(argv=["ls"]), "kind":"teleport"})
+
+# --- command with an extra key (regression: kind-aware allowed-set) ---
+vrej("command extra key intent", {**req(argv=["ls"]), "intent":"x"})
+
 print(f"\nRESULT: {npass} passed, {nfail} failed")
 sys.exit(0 if nfail == 0 else 1)
