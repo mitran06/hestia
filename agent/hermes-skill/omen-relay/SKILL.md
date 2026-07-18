@@ -19,6 +19,64 @@ owner a **Telegram button**; nothing runs on the target until the owner taps
 approve. You can only ask — you cannot approve on the owner's behalf, and you
 cannot bypass this. Do not try to.
 
+## Work sessions (open one before you act, close it when done)
+
+Nothing you relay runs unless a **work session** is open. A session is a
+bounded window the owner has approved, anchored to a plain-language statement
+of what you intend to do. Between sessions you have **no access at all** — a
+relayed command with no open session is refused, telling you to open one first.
+
+So the moment you realise you need the owner's target machine and no session is
+open, **open one first**:
+
+```
+hestia-relay session-open --intent "clean up my node projects in /srv/projects" --duration 1800
+```
+
+- `--intent "<one clear line>"` — a short, honest, specific statement of what
+  you are about to do (1–500 chars). The owner reads this **verbatim** on the
+  approvals bot and taps to approve; on approval **your exact words become the
+  trusted anchor** the broker enforces for the whole session. Write it for the
+  owner, not for yourself: concrete scope ("update deps and run the test suite
+  in myrepo"), not vague ("do some work").
+- `--duration <seconds>` — how long you expect to need, **generous but
+  realistic** (any positive number; there is genuinely no ceiling). Expiry at
+  the approved deadline and instant Revoke are the only backstops — the owner
+  can hit 🛑 Revoke at any time, and the window closes automatically when the
+  duration runs out. Ask for enough that you won't have to re-open mid-task,
+  but don't pad it to hours you won't use.
+
+`session-open` blocks until the owner approves (status `session_opened`, with
+the approved `secs`) or declines (`refused` — surface it and ask the owner, do
+not loop). Once it returns `session_opened`, run your commands normally with
+`hestia-relay -- …`. Every command you relay is shown to the owner, one line
+each, live, inside that one session message — so keep your actions matching
+what you said you'd do.
+
+When you're finished, **close the session** so access ends immediately rather
+than lingering until expiry:
+
+```
+hestia-relay session-close
+```
+
+This returns status `session_closed` and the owner's session message shows
+"ended by agent". Closing with no session open is a harmless no-op.
+
+> **Requesting time is not authorization to do anything beyond the stated
+> intent; a broader or different scope needs a NEW session.** If part-way
+> through you find you need to do something your `--intent` didn't cover
+> (touch a different tree, a different kind of change), do NOT stretch the
+> current session to cover it — `session-close` and `session-open` a fresh one
+> with an honest new intent, or tell the owner and let them decide. The window
+> buys you *time*, not *scope*.
+
+Note: for now this window captures your intent and shows the owner **every**
+command you run — it does not yet reduce per-command taps. Commands that need
+approval still get their own button (they're just also logged in the session
+message). A later piece (the reviewer) is what makes the routine, in-scope
+commands stop needing a tap.
+
 ## The client
 
 ```
@@ -81,15 +139,17 @@ hestia-relay --elevate --cwd /srv/projects/myrepo --timeout 1200 -- make build
 
 1. You run `hestia-relay -- ...`. It prints `submitted <id> … awaiting owner
    approval + result` to stderr and blocks.
-2. Free-zone commands come back immediately. Otherwise the owner gets a Telegram
-   button (first a SESSION button to open a time-boxed window, then per-command
-   buttons). The owner taps approve or deny.
+2. Free-zone commands come back immediately. Otherwise, if a session is open,
+   the owner gets a per-command Telegram button; they tap approve or deny. If NO
+   session is open, the command is refused — open one first with `session-open`
+   (see "Work sessions" above).
 3. On approve, the target runs the command and the result (stdout/stderr/exit)
    comes back through the relay. On deny/timeout you get a non-zero exit and a
    short reason on stderr.
 
-If the owner has not opened a session yet, the first request may prompt them to
-approve opening the window before the command itself runs — that is normal.
+A relayed command never opens a session on its own — YOU open the session
+explicitly with `session-open` and close it with `session-close`. Between
+sessions nothing runs; a command with no open session is refused, not queued.
 
 ## Exit codes (check these)
 
