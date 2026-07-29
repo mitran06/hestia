@@ -15,7 +15,8 @@ Wants=network-online.target
 Type=simple
 User=hestia-broker
 Group=hestia-broker
-# Site config + the secret bot token (TELEGRAM_BROKER_BOT_TOKEN) + HESTIA_* live here.
+# Site config + the secrets — the bot token (TELEGRAM_BROKER_BOT_TOKEN) and, if the
+# reviewer is enabled, its key (HESTIA_REVIEWER_KEY) — plus all HESTIA_* live here.
 EnvironmentFile=/etc/hestia-broker/broker.env
 # Pin the paths this deployment uses (the audit log matches the Part-3 chattr +a file).
 Environment=HESTIA_SPOOL=/var/lib/hestia-spool
@@ -49,6 +50,16 @@ CapabilityBoundingSet=
 #   drop RestrictNamespaces -> drop ProtectSystem=strict (use =full) -> widen ReadWritePaths. Verify with
 #   'journalctl -u hestia-broker' after start. A stricter SystemCallFilter=@system-service can be added once
 #   confirmed working. IPAddressAllow (Telegram+tailscale only) is a future tightening (Telegram IPs vary).
+#
+# REVIEWER EGRESS: with HESTIA_REVIEWER_ENABLED=1 the broker makes a THIRD outbound HTTPS call (to the
+#   reviewer endpoint) besides Telegram + tailscaled. AF_INET/AF_INET6 above already permit it; a future
+#   IPAddressAllow must include the reviewer host too.
+# USERNS PROBE (important): the startup preflight runs a LOCAL 'bwrap --unshare-* ... true' probe to decide
+#   whether auto-run may be confined. RestrictNamespaces=true here BLOCKS that probe, so the preflight would
+#   report confinement DOWN and quietly disable auto-run (every command asks). The actual confinement runs on
+#   the TARGET (in exec-argv/exec-argv-elevated), not here — so PIN the probe with HESTIA_CONFINE_USERNS=1 in
+#   broker.env (safe: the target still fails closed if IT cannot confine). Only drop RestrictNamespaces if you
+#   deliberately want the broker host itself to run the local probe.
 
 [Install]
 WantedBy=multi-user.target
