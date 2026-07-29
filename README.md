@@ -11,12 +11,12 @@ Stock agent setups (Hermes, OpenClaw, etc) give you a bad choice: run the agent 
 ```
 config/    hestia.env.example — every site-specific value (copy to hestia.env)
 box/       Phase 1: the LXD container's egress firewall + example agent config/persona
-broker/    Phase 2 (host): policy engine, daemon, dumb-pipe mover, systemd units, backstop
-target/    Phase 2 (laptop): the executor (+ bubblewrap jail) and HMAC-gated elevated wrapper
+broker/    Phase 2 (host): policy-tier engine, fail-closed LLM reviewer, daemon, dumb-pipe mover, systemd units, backstop
+target/    Phase 2 (laptop): the HMAC-gated executor (runs confined in a bubblewrap jail, or unconfined on owner approval)
 agent/     the box-side client (hestia-relay) + a skill teaching the agent to use the broker
 install/   ordered, self-proving install scripts (host/ and target/)
 network/   example Tailscale ACL scoping broker-host -> target-user
-tests/     ~139 offline tests (policy, daemon, relay, elevation crypto) — no root/network needed
+tests/     987 offline tests (policy tiers, reviewer, daemon, relay, elevation crypto) — no root/network needed
 docs/      architecture, security model, broker internals, install, config, operations, confinement
 ```
 
@@ -74,7 +74,7 @@ Then do the live checks in [docs/operations.md](docs/operations.md)
 ```bash
 cd tests && for t in test_*.py; do python3 "$t"; done
 ```
-All four suites run offline (no root, no network, no Telegram). They are the regression gate — if you change the policy or the daemon, they must stay green.
+All suites run offline (no root, no network, no Telegram) — the reviewer's network call is stubbed. They are the regression gate — if you change the policy, the reviewer, or the daemon, they must stay green.
 
 ---
 
@@ -84,7 +84,8 @@ The design principle: **the component that can be prompt-injected holds no secre
 
 - The agent lives in a box that is firewalled to internet-only — it cannot reach the broker, your laptop, or the tailnet.
 - It can only *write a request file*. A dumb pipe shuttles opaque, size-bounded blobs to the host.
-- The broker (a separate user with no `lxd`/`docker`/`sudo`) validates and classifies every request, then asks **you** on a *second* Telegram bot whose token the box never sees.
+- The broker (a separate user with no `lxd`/`docker`/`sudo`) puts every request through a **deterministic policy-tier floor** that can never be lowered: the truly dangerous tiers (egress, secrets, sudo, persistence) *always* ask **you** on a *second* Telegram bot whose token the box never sees.
+- Ordinary middle commands are judged by a **fail-closed second LLM** against the session's stated intent — an in-intent command runs automatically (network-isolated in a bubblewrap jail); anything off-intent, or a reviewer that is unreachable or disabled, falls closed to your tap.
 - What runs equals what you approved — commands are hashed and executed from the broker's own copy, never a re-read of a file the box could swap.
 - Reaching *your* private files needs an unforgeable, single-use, expiring capability the box cannot mint.
 
@@ -104,4 +105,4 @@ This is a personal project, shared as-is under the [MIT license](LICENSE), with 
 
 ## Credits
 
-Built to confine and empower [Nous Research Hermes](https://github.com/NousResearch/Hermes); transport by [Tailscale](https://tailscale.com); free-zone jail by [bubblewrap](https://github.com/containers/bubblewrap).
+Built to confine and empower [Nous Research Hermes](https://github.com/NousResearch/Hermes); transport by [Tailscale](https://tailscale.com); auto-run confinement jail by [bubblewrap](https://github.com/containers/bubblewrap).

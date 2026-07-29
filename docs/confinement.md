@@ -10,6 +10,13 @@ which the box cannot invoke on its own.
 Phase 2 (the host-side broker + target executor, gated by a second Telegram
 bot) is covered in its own docs — this guide gets the confinement right first.
 
+> **Two kinds of confinement.** This page is about the **Phase-1 wall**: the LXD
+> box the whole agent lives in. Phase 2 adds a *second, independent* runtime
+> confinement — commands the broker auto-runs on your target execute inside a
+> bubblewrap jail with the network unshared (see
+> [broker.md](broker.md) and [architecture.md](architecture.md)). The two are
+> separate boundaries; both fail closed.
+
 Throughout, replace `<PLACEHOLDER>` values and set your site config in
 `config/hestia.env` (copy from `config/hestia.env.example`). Commands marked
 **(host, root)** run on the server that hosts the container.

@@ -11,7 +11,7 @@ back. Assumes the install runbook (`docs/installation.md`) has completed.
 | Service | Runs as | What it does |
 |---------|---------|--------------|
 | `hestia-mover` | `hestia-mover` | Dumb pipe: moves opaque UUID-named blobs between the confined box and the host spool. No policy, no secrets. |
-| `hestia-broker` | `hestia-broker` | Policy engine + Telegram approval + relay to the target over Tailscale SSH. Holds the bot token and (optionally) the elevation key. |
+| `hestia-broker` | `hestia-broker` | Policy-tier engine + fail-closed LLM reviewer + Telegram approval + confined relay to the target over Tailscale SSH. Holds the bot token, the elevation key, and (if enabled) the reviewer API key. |
 | `hestia-fw-backstop` | root (oneshot) | Loads the independent nftables table that fences the box off the tailnet. `RemainAfterExit` — it applies rules at boot, not a long-running process. |
 
 ### Start / stop / status
@@ -48,10 +48,22 @@ sudo tail -n 50 /var/lib/hestia-broker/log/audit.log | python3 -m json.tool --js
   || sudo tail -n 50 /var/lib/hestia-broker/log/audit.log    # pretty-print if your python supports it
 ```
 
-Fields you will see include `decision` (`IN_SCOPE` = auto-run free-zone, `NEEDS_BUTTON`
-= waited for your tap, `REJECT` = malformed/blocked), `reason`, `cmd_hash`,
-`session_id`, `request_id`, `cwd`, `elevate`, `argv`, plus lifecycle events like
-`BROKER_START`, `SESSION_OPENED`, and elevated `run_as`.
+Each record carries a `decision` naming the **event** and, for a command, a `tier`
+naming the deterministic floor result. Decisions you will see include:
+
+- `BROKER_START`, `BROKER_PREFLIGHT` (the startup self-check: `userns`, `elevation`,
+  `reviewer` health), `SESSION_OPENED` / `SESSION_CLOSED` / `SESSION_DENIED`;
+- `REJECT` (malformed/invalid, dropped before any button), `REFUSED` (a policy /
+  binding / cap / no-session refusal — including a `REFUSE`-tier hardline);
+- `EXFIL_CAP` (the per-window distinct-command cap fell a command to a tap),
+  `AUTO_PRECONDITION_FALLBACK` (auto-mode degraded → command sent to a tap),
+  `BINDING_MISMATCH` (hash or tier drift at dispatch → refused);
+- `REVIEWER_ERROR`, `REVIEW_BACKPRESSURE`, `REVIEW_WINDOW_CLOSED`,
+  `REVIEWS_TORN_DOWN` (Layer-2 reviewer events).
+
+Alongside `decision` you will see `tier` (`REFUSE` / `HARD_DENY` / `FREE_ZONE` /
+`SOFT_DENY` / `ALLOW`), `reason`, `cmd_hash`, `session_id`, `request_id`, `cwd`,
+`argv`, and the elevated `run_as`.
 
 **Verify it is still append-only:**
 
@@ -77,22 +89,22 @@ can be torn down remotely even though the local SSH client exiting would not kil
 remote tree.
 
 - **`/panic`** — send `/panic` (or tap the session STOP button) to the broker bot in
-  Telegram. The broker closes the open session, kills every in-flight command tree (via
-  `exec-argv --kill <token>` on the target, or the elevated `kill` for owner-owned
-  trees), and denies all pending approval buttons.
+  Telegram. The broker closes the open session, kills every in-flight command tree, tears
+  down any in-flight reviews (fail-closed to refused), and denies all pending approval
+  buttons.
 - A single command can also be denied at its button; if it was already running, the
   broker issues the kill for that token.
 
-Elevated (owner-owned) process groups cannot be signalled by `hestia-agent`, so their
-revoke goes through `sudo -n exec-argv-elevated kill <ticket>` — a broker-minted,
-HMAC-signed kill ticket. Both paths are idempotent (safe to retry).
+Every command now runs as **you** (the owner unix user) via the HMAC-ticketed executor,
+so an unprivileged caller cannot signal it: the revoke goes through
+`sudo -n exec-argv-elevated kill <ticket>` — a broker-minted, HMAC-signed kill ticket
+over the same sudoers path. It is idempotent (safe to retry).
 
-To confirm nothing lingers after a panic, check for leftover pgid markers:
+To confirm nothing lingers after a panic, check for leftover pgid / single-use markers:
 
 ```bash
 # on the target
-sudo ls -la /home/hestia-agent/.hestia-run/     # free-zone pgid files (should drain)
-sudo ls -la /var/lib/hestia-elevated/           # elevated pgid + single-use markers
+sudo ls -la /var/lib/hestia-elevated/           # pgid + single-use ticket markers (should drain)
 ```
 
 ---
@@ -179,9 +191,15 @@ sandbox blocking Tailscale/Telegram. To loosen the sandbox, follow the tuning no
 username) and that you have messaged the bot at least once. The broker honors taps
 **only** from that id; a wrong id fails closed (matches nobody).
 
-**Free-zone commands refuse to run.** `exec-argv` fails closed if bubblewrap can't spawn
-a user-namespace sandbox. Re-run `install/target/2-exec-argv.sh` and read the bwrap
-proof; enable unprivileged user namespaces if your kernel/AppArmor disables them.
+**Every command suddenly asks for a tap (auto-mode degraded).** The broker fails *closed*
+to a manual tap whenever an auto-run precondition is unmet — the reviewer is disabled /
+unconfigured / unreachable (breaker open), the elevation key is missing, or unprivileged
+user namespaces are unavailable so a command couldn't be confined. The startup preflight
+DMs you once when this happens; the `BROKER_PREFLIGHT` audit line and any
+`AUTO_PRECONDITION_FALLBACK` records name which one is down. Check
+`journalctl -u hestia-broker`, confirm `HESTIA_REVIEWER_ENABLED=1` with a valid key, that
+the elevation key is imported, and that `bwrap --unshare-net --bind / / -- true` succeeds
+on the target (enable unprivileged user namespaces if your kernel/AppArmor disables them).
 
 **Elevated commands rejected.** Check the key is imported on the HOST
 (`/etc/hestia-broker/elevation.key`, readable by `hestia-broker`) **and** present on the
