@@ -5,7 +5,7 @@ Invoked (via ONE narrow NOPASSWD sudoers line) as ROOT:
     sudo -n /usr/local/lib/hestia/exec-argv-elevated run  <base64 run-ticket>
     sudo -n /usr/local/lib/hestia/exec-argv-elevated kill <base64 kill-ticket>
 Authenticates a BROKER-SIGNED HMAC ticket, then (for `run`) PERMANENTLY drops privilege to run_as
-(the configured owner user) and execve's the approved argv — reaching the OWNER's own files (the acid test).
+(default: the owner user) and execve's the approved argv — reaching the OWNER's own files (the acid test).
 ELEVATION is a BROKER-HELD capability: without the shared key no ticket is forgeable, so a host-local
 caller who can reach hestia-agent's SSH path STILL cannot elevate. The box can't reach the tailnet at all.
 
@@ -19,9 +19,21 @@ import sys, os, json, base64, hmac, hashlib, time, signal, pwd, re, stat as _sta
 KEY_FILE = "/etc/hestia/elevation.key"          # root 0400 (== the broker's shared key)
 RUNDIR   = "/var/lib/hestia-elevated"           # root 0700: pgid + single-use markers (agent CANNOT tamper)
 TTL      = 300                                  # ticket freshness (seconds)
-ALLOWED_RUNAS = {"@OWNER_RUNAS@"}                 # rendered at install to your owner unix user; elevated runs ONLY as that user (never root — review N1)
+ALLOWED_RUNAS = {"@OWNER_RUNAS@"}                       # v1: elevated runs ONLY as the owner (never root — see review N1)
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 E_USAGE, E_KEY, E_DECODE, E_SIG, E_TTL, E_REPLAY, E_SCHEMA, E_CALLER, E_RUNAS, E_EXEC = 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+
+# Shell/login-rc dotfiles that run code at shell-start / login / logout — each is RO-bound in the confined
+# jail (see _bwrap_args) so a confined run cannot plant a payload that later executes UNCONFINED-with-network
+# at next login (delayed-exfil bypass). SOURCE OF TRUTH: broker.py._PERSISTENCE_PATH_FRAGMENTS — this MUST
+# stay a superset-or-equal of the shell-rc names the broker's lexical floor HARD_DENYs. The wrapper keeps a
+# local copy (rather than importing the large broker module into this privileged root path); the executor↔
+# broker sync is ENFORCED by test_confinement.py's M2-jail CROSS-CHECK (imports both, fails on any drift).
+# When you add a shell-rc name to broker's floor, add it HERE too — the cross-check test will fail until you do.
+_SHELL_RC_FILES = (
+    ".bashrc", ".zshrc", ".profile", ".bash_profile", ".bash_login", ".zprofile",
+    ".zshenv", ".zlogin", ".zlogout", ".xsessionrc", ".xprofile", ".bash_logout",
+)
 
 
 def die(code, msg):
@@ -100,12 +112,18 @@ def _ensure_rundir():
         os.mkdir(RUNDIR, 0o700)                             # fails (FileExistsError) if a symlink squats the path
 
 
-def _run(tok):
-    _check_caller()
-    t = _verify(tok, "run")
-    for k in ("session_id", "request_id", "cwd", "run_as", "argv", "exec_token"):
+def _validate_run(t):
+    """Pure schema validation of a verified run-ticket (NO side effects, NO privilege): required keys,
+    the strict-bool `confined` gate, uuid + run_as-allowlist + argv/cwd shape. Returns (rid, etok,
+    run_as, argv, cwd) or die()s. Runs BEFORE any filesystem/privileged op so it is unit-testable."""
+    for k in ("session_id", "request_id", "cwd", "run_as", "argv", "exec_token", "confined"):
         if k not in t:
             die(E_SCHEMA, f"missing {k}")
+    # `confined` is REQUIRED + STRICTLY bool (fail-CLOSED, 2c §3): a signed-but-malformed value (0, '',
+    # [], null, 'true' ...) must REFUSE, never take a branch by truthiness. HMAC does not save you — the
+    # bad value is validly signed (a broker bug / rolled-back broker). Only literal JSON true/false pass.
+    if not isinstance(t["confined"], bool):
+        die(E_SCHEMA, "confined must be a bool")
     rid, etok, run_as, argv, cwd = t["request_id"], t["exec_token"], t["run_as"], t["argv"], t["cwd"]
     if not (_uuid(rid) and _uuid(etok)):
         die(E_SCHEMA, "bad request_id/exec_token")
@@ -115,6 +133,76 @@ def _run(tok):
         die(E_SCHEMA, "bad argv")
     if not isinstance(cwd, str) or "\x00" in cwd:
         die(E_SCHEMA, "bad cwd")
+    return rid, etok, run_as, argv, cwd
+
+
+def _bwrap_args(uid, home):
+    """The EXACT ordered bwrap option vector for a CONFINED run (2c §3) — everything BETWEEN `bwrap` and the
+    `--` separator. Order is LOAD-BEARING: bwrap applies fs ops strictly left-to-right, so `--bind / /` MUST
+    precede `--dev`/`--proc`/`--tmpfs` (else they get overmounted, leaking host /dev + /proc). Confinement is
+    option B: full filesystem (--bind / /) + network isolation (--unshare-net) + PID isolation
+    (--unshare-pid, kills the setsid orphan on teardown, no host-PID leak). NO fs jail, NO secret overlays.
+      - --tmpfs /run masks the ENTIRE /run tree — every path-based AF_UNIX credential/control socket that
+        --bind / / would otherwise leak into the jail. AF_UNIX sockets are NOT affected by --unshare-net,
+        so a confined process (in-jail uid == the owner user) could otherwise connect to a host-group-privileged
+        socket and get a fully-networked ROOT process OUTSIDE the net+pid namespaces — defeating BOTH the
+        egress block and revoke. Masking the whole /run (not just /run/user/$UID) is the ONLY sound choice
+        when run_as is in host groups (docker/libvirt/wheel): the narrower --tmpfs /run/user/$UID left
+        /run/docker.sock (docker group -> `docker run --network=host -v /:/host` = root+egress, holds
+        HEADLESS with no polkit/session dep), /run/dbus/system_bus_socket (system-bus StartTransientUnit)
+        and /run/libvirt/* reachable — empirically CONNECTED from the jail. --tmpfs /run is a strict
+        superset: it still masks /run/user/$UID/bus + systemd/private (BLOCKER-1) AND closes the docker /
+        system-bus / libvirt sockets. Persistence dirs (below) live under $HOME, not /run, so they are
+        unaffected. If a legit tool ever needs a specific /run path, re-provide ONLY that one --ro-bind
+        AFTER this tmpfs.
+      - --tmpfs /run/user/$UID is retained (nested on top of the /run tmpfs — harmless, bwrap mounts both)
+        to keep the 2c §3 mandated BLOCKER-1 mask of the owner's session-bus path EXPLICIT and load-bearing
+        under a future refactor; it is redundant to the /run mask by construction, never a regression.
+      - --ro-bind-try the persistence write-targets so confined code cannot plant a unit / rc-file that
+        later runs UNCONFINED with network (delayed-exfil bypass). These are HARD_DENY at the lexical floor
+        anyway, so RO-binding them costs no legit capability. The shell/login-rc set is _SHELL_RC_FILES,
+        kept in sync with broker.py._PERSISTENCE_PATH_FRAGMENTS (source of truth) — audit-fix M2-jail added
+        .zshenv/.zprofile/.zlogin/.zlogout/.xsessionrc/.xprofile/.bash_login/.bash_logout to match the floor.
+      - $ZDOTDIR: if set, zsh reads its rc files (.zshenv/.zshrc/.zprofile/.zlogin/.zlogout) from $ZDOTDIR
+        rather than $HOME, so we ALSO RO-bind $ZDOTDIR/<those> when $ZDOTDIR is set and differs from $HOME.
+        (--ro-bind-try no-ops any target that does not exist, so binding both locations is always safe.)
+        Residual: .zshenv is read BEFORE $ZDOTDIR can be exported from it, so the ~/.zshenv bind is the one
+        that matters for that file; the $ZDOTDIR binds cover the later-sourced rc files.
+      - Deliberately NO --new-session (would detach from the recorded pgid and break killpg revoke) and NO
+        --unshare-user (would break the ratified "runs as the owner, owns the owner's files")."""
+    persist = [
+        f"{home}/.config/systemd/user", f"{home}/.config/autostart", f"{home}/.config/environment.d",
+    ]
+    persist += [f"{home}/{rc}" for rc in _SHELL_RC_FILES]
+    # Honor $ZDOTDIR: zsh's .zshenv/.zshrc/.zprofile/.zlogin/.zlogout come from $ZDOTDIR when it is set.
+    zdotdir = os.environ.get("ZDOTDIR")
+    if zdotdir and os.path.isabs(zdotdir) and os.path.normpath(zdotdir) != os.path.normpath(home):
+        zdotdir = os.path.normpath(zdotdir)
+        persist += [f"{zdotdir}/{rc}" for rc in (".zshenv", ".zshrc", ".zprofile", ".zlogin", ".zlogout")]
+    a = ["--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
+         "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+         "--tmpfs", "/run", "--tmpfs", f"/run/user/{uid}"]
+    for p in persist:
+        a += ["--ro-bind-try", p, p]
+    return a
+
+
+def _confined_exec_argv(confined, argv, uid, home):
+    """Map the STRICT-bool `confined` to the argv to execvpe (2c §3). `is True` -> wrap in bwrap with the
+    exact vector; `is False` -> the plain approved argv (today's behavior). Caller MUST have already
+    validated `confined` is a bool (see _validate_run) — this is a clean is-True / is-False branch with NO
+    truthiness and NO fallthrough."""
+    if confined is True:
+        return ["bwrap", *_bwrap_args(uid, home), "--", *argv]
+    if confined is False:
+        return list(argv)
+    die(E_SCHEMA, "confined is not a strict bool")   # defensive: unreachable if _validate_run ran
+
+
+def _run(tok):
+    _check_caller()
+    t = _verify(tok, "run")
+    rid, etok, run_as, argv, cwd = _validate_run(t)
     _ensure_rundir()
     _sweep_stale()
     try:                                                    # single-use: O_EXCL marker on NON-tmpfs (/var/lib)
@@ -138,10 +226,16 @@ def _run(tok):
         os.setresuid(pw.pw_uid, pw.pw_uid, pw.pw_uid)
     env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": pw.pw_dir,
            "USER": run_as, "LOGNAME": run_as, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "SHELL": "/bin/bash"}
+    # CONFINEMENT (2c §3), decided ONLY by the validated strict-bool `confined` (fail-CLOSED, NO fallthrough):
+    #   is True  -> execvpe("bwrap", ["bwrap", *BWRAP_ARGS(run_as uid, run_as home), "--", *argv]); bwrap runs
+    #               here AFTER the permanent uid-drop, as an unprivileged user namespace. bwrap-missing raises
+    #               FileNotFoundError -> the handler below dies E_EXEC (fail-closed, NEVER unconfined).
+    #   is False -> execvpe(argv[0], argv) — today's plain elevated run.
+    exec_argv = _confined_exec_argv(t["confined"], argv, pw.pw_uid, pw.pw_dir)
     try:
-        os.execvpe(argv[0], argv, env)                      # shell=False; runs as run_as
+        os.execvpe(exec_argv[0], exec_argv, env)            # shell=False; runs as run_as (bwrap-wrapped iff confined)
     except FileNotFoundError:
-        die(E_EXEC, f"command not found: {argv[0]!r}")
+        die(E_EXEC, f"command not found: {exec_argv[0]!r}")  # incl. bwrap absent -> E_EXEC (fail-closed, C4)
     except OSError as e:
         die(E_EXEC, f"exec failed: {e}")
 
