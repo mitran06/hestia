@@ -1,5 +1,5 @@
 ---
-name: omen-relay
+name: target-relay
 description: >-
   Run commands on the owner's TARGET machine (their laptop/host) from inside the
   confined box, through the Hestia capability broker. Use this whenever the owner

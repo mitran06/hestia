@@ -115,7 +115,7 @@ never written into these files. Point the box's environment at your key using
 the env-var NAME you set in the config (`<LLM_API_KEY_ENV>`).
 
 Later, once Phase 2 is up, add the broker skill
-(`agent/hermes-skill/omen-relay/SKILL.md`) into the agent's skills dir so it
+(`agent/hermes-skill/target-relay/SKILL.md`) into the agent's skills dir so it
 knows to request target actions via `hestia-relay`.
 
 ---
@@ -241,4 +241,4 @@ firewall already permits — so this does not weaken the wall.
 The box has **no key and no route** to your other machines. The only way it can
 ever act on your laptop/host is **Phase 2**: the capability broker, where every
 crossing needs a Telegram button enforced below the LLM — see the broker docs
-and `agent/hermes-skill/omen-relay/SKILL.md`.
+and `agent/hermes-skill/target-relay/SKILL.md`.

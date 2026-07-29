@@ -90,7 +90,7 @@ memory:
 # --- The broker skill -----------------------------------------------------
 # The ONLY gated path from this confined box to the owner's target machine is
 # the `hestia-relay` client, taught by the broker skill at:
-#     agent/hermes-skill/omen-relay/SKILL.md
+#     agent/hermes-skill/target-relay/SKILL.md
 # Install that skill into the agent's skills dir so it knows to REQUEST target
 # actions via `hestia-relay -- CMD ...` (every crossing needs a Telegram
 # button the broker enforces below the LLM). The box holds no key and no route
