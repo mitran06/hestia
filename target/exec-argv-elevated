@@ -158,9 +158,12 @@ def _bwrap_args(uid, home):
       - --tmpfs /run/user/$UID is retained (nested on top of the /run tmpfs — harmless, bwrap mounts both)
         to keep the 2c §3 mandated BLOCKER-1 mask of the owner's session-bus path EXPLICIT and load-bearing
         under a future refactor; it is redundant to the /run mask by construction, never a regression.
-      - --ro-bind-try the persistence write-targets so confined code cannot plant a unit / rc-file that
-        later runs UNCONFINED with network (delayed-exfil bypass). These are HARD_DENY at the lexical floor
-        anyway, so RO-binding them costs no legit capability. The shell/login-rc set is _SHELL_RC_FILES,
+      - MASK the persistence write-targets so confined code cannot plant a unit / rc-file that later runs
+        UNCONFINED with network (delayed-exfil bypass) — dirs via ephemeral --tmpfs, files via an empty RO
+        /dev/null bind. This holds even when the target does NOT pre-exist (an earlier --ro-bind-try silently
+        no-op'd on a missing source, leaving that path writable through --bind / / — a confined run could then
+        create a fresh dotfile/unit). These are HARD_DENY at the lexical floor anyway (best-effort — the floor
+        is lexical and interpreter-evadable, so this jail mask is the load-bearing defense). Set is _SHELL_RC_FILES,
         kept in sync with broker.py._PERSISTENCE_PATH_FRAGMENTS (source of truth) — audit-fix M2-jail added
         .zshenv/.zprofile/.zlogin/.zlogout/.xsessionrc/.xprofile/.bash_login/.bash_logout to match the floor.
       - $ZDOTDIR: if set, zsh reads its rc files (.zshenv/.zshrc/.zprofile/.zlogin/.zlogout) from $ZDOTDIR
@@ -170,20 +173,29 @@ def _bwrap_args(uid, home):
         that matters for that file; the $ZDOTDIR binds cover the later-sourced rc files.
       - Deliberately NO --new-session (would detach from the recorded pgid and break killpg revoke) and NO
         --unshare-user (would break the ratified "runs as the owner, owns the owner's files")."""
-    persist = [
+    persist_dirs = [
         f"{home}/.config/systemd/user", f"{home}/.config/autostart", f"{home}/.config/environment.d",
     ]
-    persist += [f"{home}/{rc}" for rc in _SHELL_RC_FILES]
+    persist_files = [f"{home}/{rc}" for rc in _SHELL_RC_FILES]
     # Honor $ZDOTDIR: zsh's .zshenv/.zshrc/.zprofile/.zlogin/.zlogout come from $ZDOTDIR when it is set.
     zdotdir = os.environ.get("ZDOTDIR")
     if zdotdir and os.path.isabs(zdotdir) and os.path.normpath(zdotdir) != os.path.normpath(home):
         zdotdir = os.path.normpath(zdotdir)
-        persist += [f"{zdotdir}/{rc}" for rc in (".zshenv", ".zshrc", ".zprofile", ".zlogin", ".zlogout")]
+        persist_files += [f"{zdotdir}/{rc}" for rc in (".zshenv", ".zshrc", ".zprofile", ".zlogin", ".zlogout")]
     a = ["--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
          "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
          "--tmpfs", "/run", "--tmpfs", f"/run/user/{uid}"]
-    for p in persist:
-        a += ["--ro-bind-try", p, p]
+    # MASK the persistence targets so a confined run cannot PLANT a delayed-exec payload — masking that holds
+    # WHETHER OR NOT the target pre-exists. (The old `--ro-bind-try p p` SILENTLY NO-OPS on a MISSING source,
+    # leaving the `--bind / /` root WRITABLE there — so a confined run could create a fresh ~/.bashrc or
+    # ~/.config/autostart/*.desktop / ~/.config/systemd/user/*.service that then runs UNCONFINED-with-network
+    # at the owner's next login/shell. Fix: dirs -> ephemeral tmpfs (anything written inside vanishes with the
+    # jail, never persists to the host); files -> empty read-only /dev/null bind (uncreatable + unwritable).
+    # bwrap creates missing mountpoints + parent dirs, so the mask holds for not-yet-existing targets too.)
+    for p in persist_dirs:
+        a += ["--tmpfs", p]
+    for p in persist_files:
+        a += ["--ro-bind", "/dev/null", p]
     return a
 
 

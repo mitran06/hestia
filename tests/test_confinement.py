@@ -63,22 +63,25 @@ expected = [
     "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
     "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
     "--tmpfs", "/run", "--tmpfs", f"/run/user/{UID}",
-    "--ro-bind-try", f"{HOME}/.config/systemd/user",  f"{HOME}/.config/systemd/user",
-    "--ro-bind-try", f"{HOME}/.config/autostart",     f"{HOME}/.config/autostart",
-    "--ro-bind-try", f"{HOME}/.config/environment.d", f"{HOME}/.config/environment.d",
-    # audit-fix M2-jail: the shell/login-rc set now MATCHES broker.py's persistence floor (see _SHELL_RC_FILES)
-    "--ro-bind-try", f"{HOME}/.bashrc",       f"{HOME}/.bashrc",
-    "--ro-bind-try", f"{HOME}/.zshrc",        f"{HOME}/.zshrc",
-    "--ro-bind-try", f"{HOME}/.profile",      f"{HOME}/.profile",
-    "--ro-bind-try", f"{HOME}/.bash_profile", f"{HOME}/.bash_profile",
-    "--ro-bind-try", f"{HOME}/.bash_login",   f"{HOME}/.bash_login",
-    "--ro-bind-try", f"{HOME}/.zprofile",     f"{HOME}/.zprofile",
-    "--ro-bind-try", f"{HOME}/.zshenv",       f"{HOME}/.zshenv",
-    "--ro-bind-try", f"{HOME}/.zlogin",       f"{HOME}/.zlogin",
-    "--ro-bind-try", f"{HOME}/.zlogout",      f"{HOME}/.zlogout",
-    "--ro-bind-try", f"{HOME}/.xsessionrc",   f"{HOME}/.xsessionrc",
-    "--ro-bind-try", f"{HOME}/.xprofile",     f"{HOME}/.xprofile",
-    "--ro-bind-try", f"{HOME}/.bash_logout",  f"{HOME}/.bash_logout",
+    # persistence DIRS -> ephemeral --tmpfs (writes inside vanish with the jail); persistence FILES ->
+    # RO /dev/null bind (uncreatable + unwritable). Masks WHETHER OR NOT the target pre-exists — closes the
+    # finding-1 hole where --ro-bind-try silently no-op'd on a missing source, leaving --bind / / writable.
+    "--tmpfs", f"{HOME}/.config/systemd/user",
+    "--tmpfs", f"{HOME}/.config/autostart",
+    "--tmpfs", f"{HOME}/.config/environment.d",
+    # audit-fix M2-jail: the shell/login-rc set MATCHES broker.py's persistence floor (see _SHELL_RC_FILES)
+    "--ro-bind", "/dev/null", f"{HOME}/.bashrc",
+    "--ro-bind", "/dev/null", f"{HOME}/.zshrc",
+    "--ro-bind", "/dev/null", f"{HOME}/.profile",
+    "--ro-bind", "/dev/null", f"{HOME}/.bash_profile",
+    "--ro-bind", "/dev/null", f"{HOME}/.bash_login",
+    "--ro-bind", "/dev/null", f"{HOME}/.zprofile",
+    "--ro-bind", "/dev/null", f"{HOME}/.zshenv",
+    "--ro-bind", "/dev/null", f"{HOME}/.zlogin",
+    "--ro-bind", "/dev/null", f"{HOME}/.zlogout",
+    "--ro-bind", "/dev/null", f"{HOME}/.xsessionrc",
+    "--ro-bind", "/dev/null", f"{HOME}/.xprofile",
+    "--ro-bind", "/dev/null", f"{HOME}/.bash_logout",
 ]
 check("_bwrap_args is the EXACT ordered vector", args, expected)
 
@@ -106,18 +109,20 @@ ok("--tmpfs /run precedes the nested --tmpfs /run/user/$UID (whole-tree mask fir
    args.index("/run") < args.index(f"/run/user/{UID}"))
 ok("--new-session ABSENT (would break killpg revoke, C11)", "--new-session" not in args)
 ok("--unshare-user ABSENT (would break owner file ownership, option B)", "--unshare-user" not in args)
-# every persistence write-target is RO-bound (delayed-exfil bypass close), none is a rw --bind
-for pdir in (".config/systemd/user", ".config/autostart", ".config/environment.d",
-             ".bashrc", ".zshrc", ".profile", ".bash_profile"):
+# every persistence write-target is MASKED (delayed-exfil bypass close): dirs via ephemeral --tmpfs, files
+# via a RO /dev/null bind — never a rw --bind, and CRUCIALLY never --ro-bind-try (which no-ops when the
+# source is missing, the finding-1 hole). This holds even for not-yet-existing targets.
+for pdir in (".config/systemd/user", ".config/autostart", ".config/environment.d"):
     p = f"{HOME}/{pdir}"
-    ok(f"persistence target {pdir} is --ro-bind-try (RO), never a rw --bind",
-       p in args and args[args.index(p) - 1] == "--ro-bind-try")  # first occurrence (SRC) preceded by the RO flag
-# stricter: each persistence path appears as the triple (--ro-bind-try SRC DST) with SRC==DST
-for pdir in (".config/systemd/user", ".bashrc", ".bash_profile"):
-    p = f"{HOME}/{pdir}"
-    found = any(args[k] == "--ro-bind-try" and args[k+1] == p and args[k+2] == p
-                for k in range(len(args) - 2))
-    ok(f"{pdir} bound as (--ro-bind-try {pdir} {pdir}) src==dst", found)
+    ok(f"persistence DIR {pdir} is masked by --tmpfs (ephemeral; a plant cannot persist)",
+       p in args and args[args.index(p) - 1] == "--tmpfs")
+for pf in (".bashrc", ".zshrc", ".profile", ".bash_profile"):
+    p = f"{HOME}/{pf}"
+    idx = args.index(p)
+    ok(f"persistence FILE {pf} is masked by (--ro-bind /dev/null {pf}) — uncreatable even if absent",
+       idx >= 2 and args[idx - 1] == "/dev/null" and args[idx - 2] == "--ro-bind")
+ok("NO persistence target is left as --ro-bind-try (the finding-1 no-op-on-missing hole is closed)",
+   "--ro-bind-try" not in args)
 
 print("== (a) UNIT: the confined-vs-plain exec argv selection (decided ONLY by strict bool) ==")
 argv = ["cat", "/home/owner/resume.tex"]
@@ -226,14 +231,15 @@ _shellrc_frags = [f for f in _broker._PERSISTENCE_PATH_FRAGMENTS
                   if f.startswith("/.") and "/" not in f[1:]]
 ok("broker floor exposes >= the 12 known shell/login-rc fragments (sanity on the source of truth)",
    len(_shellrc_frags) >= 12)
-# every shell-rc fragment must appear in the executor vector as (--ro-bind-try $HOME+frag $HOME+frag), src==dst
+# every shell-rc fragment must appear in the executor vector masked as (--ro-bind /dev/null $HOME+frag) —
+# a RO empty file, uncreatable/unwritable even when the real dotfile is absent (finding-1 fix).
 _missing = []
 for _frag in _shellrc_frags:
     _p = f"{HOME}{_frag}"          # e.g. /.zshenv -> $HOME/.zshenv
-    _bound = any(args[k] == "--ro-bind-try" and args[k+1] == _p and args[k+2] == _p
+    _bound = any(args[k] == "--ro-bind" and args[k+1] == "/dev/null" and args[k+2] == _p
                  for k in range(len(args) - 2))
     if not _bound: _missing.append(_frag)
-    ok(f"M2-jail: shell-rc {_frag} is RO-bound in the executor vector (src==dst)", _bound)
+    ok(f"M2-jail: shell-rc {_frag} is /dev/null-masked in the executor vector", _bound)
 ok("M2-jail: executor RO-bind set COVERS EVERY broker-floor shell-rc fragment (single-source sync)",
    _missing == [])
 
@@ -246,9 +252,9 @@ if _saved_zdotdir is not None: os.environ["ZDOTDIR"] = _saved_zdotdir
 else: os.environ.pop("ZDOTDIR", None)
 for _zrc in (".zshenv", ".zshrc", ".zprofile", ".zlogin", ".zlogout"):
     _zp = f"{_zd}/{_zrc}"
-    _bound = any(_args_zd[k] == "--ro-bind-try" and _args_zd[k+1] == _zp and _args_zd[k+2] == _zp
+    _bound = any(_args_zd[k] == "--ro-bind" and _args_zd[k+1] == "/dev/null" and _args_zd[k+2] == _zp
                  for k in range(len(_args_zd) - 2))
-    ok(f"M2-jail: $ZDOTDIR/{_zrc} is RO-bound when $ZDOTDIR is set (src==dst)", _bound)
+    ok(f"M2-jail: $ZDOTDIR/{_zrc} is /dev/null-masked when $ZDOTDIR is set", _bound)
 # a $ZDOTDIR equal to $HOME (or relative) must NOT add duplicate/garbage binds — same vector as base case
 os.environ["ZDOTDIR"] = HOME
 _args_home = ev._bwrap_args(UID, HOME)
@@ -383,38 +389,36 @@ else:
        out.strip() == "RESIDUAL True BLOCKED")
     shutil.rmtree(d, ignore_errors=True); shutil.rmtree(d2, ignore_errors=True)
 
-    # 5b) M2-jail EROFS — a confined WRITE to each newly-covered shell/login-rc file returns EROFS.
-    # These rc files run code at shell start / login; if a confined run could overwrite one, it would plant
-    # a payload that later executes UNCONFINED-with-network (delayed-exfil bypass). --ro-bind-try makes the
-    # file read-only IN THE JAIL, so open('w')/open('a') must fail with errno EROFS (Read-Only File System).
-    # NOTE: --ro-bind-try only binds a target that EXISTS on the host, so we ensure each exists first (and
-    # remove ONLY the ones WE created — never the user's real rc files).
-    print("== (b) JAIL PROOF: M2-jail EROFS — confined write to each shell-rc is Read-Only-FS ==")
-    EROFS = __import__("errno").EROFS
-    _created = []
-    for _rc in (".zshenv", ".zprofile", ".zlogin", ".xsessionrc"):
-        _hp = os.path.join(HOME, _rc)
-        if not os.path.exists(_hp):
-            open(_hp, "w").close(); _created.append(_hp)
+    # 5b) FINDING-1 REGRESSION — a confined run CANNOT PLANT a persistence payload into a target that does
+    # NOT pre-exist. These rc/autostart/unit paths run code at the owner's next login/shell; the OLD
+    # --ro-bind-try silently NO-OP'd on a MISSING source, leaving the --bind / / root writable there, so a
+    # confined run could CREATE a fresh dotfile/unit that then ran UNCONFINED-with-network (delayed-exfil).
+    # The fix masks each target regardless of existence: files -> RO /dev/null bind (uncreatable); dirs ->
+    # ephemeral tmpfs (writes inside vanish with the jail). We test against a SCRATCH $HOME (NEVER the user's
+    # real rc files) where every persistence target is guaranteed ABSENT — the exact case the old test missed.
+    print("== (b) JAIL PROOF: FINDING-1 — confined run cannot PLANT into a MISSING persistence target ==")
+    _sh = tempfile.mkdtemp(prefix="jail-scratchhome-", dir=HOME)     # scratch $HOME under --bind / / (real fs)
+    _bwa_sh = ev._bwrap_args(UID, _sh)                               # the jail vector targeting the scratch home
+    _PAY = "PLANTED-PAYLOAD-curl-evil-sh"
     try:
-        for _rc in (".zshenv", ".zprofile", ".zlogin", ".xsessionrc"):
-            _hp = os.path.join(HOME, _rc)
-            rc, out, err, d = jail_run(
-                "import errno\n"
-                f"p = {_hp!r}\n"
+        for _rel in (".bashrc", ".config/autostart/evil.desktop", ".config/systemd/user/evil.service"):
+            _tgt = os.path.join(_sh, _rel)
+            ok(f"precondition: scratch ~/{_rel} is ABSENT before the jail run", not os.path.exists(_tgt))
+            _probe = os.path.join(_sh, "plant_probe.py")
+            open(_probe, "w").write(
+                "import os\n"
+                f"tgt = {_tgt!r}\n"
                 "try:\n"
-                "    open(p, 'a').write('# planted-in-jail\\n'); print('WROTE')\n"
+                "    os.makedirs(os.path.dirname(tgt), exist_ok=True)\n"
+                f"    open(tgt, 'w').write({_PAY!r}); print('WROTE-IN-JAIL')\n"
                 "except OSError as e:\n"
                 "    print('BLOCKED', e.errno)\n"
             )
-            parts = out.split()
-            erofs = len(parts) == 2 and parts[0] == "BLOCKED" and int(parts[1]) == EROFS
-            ok(f"M2-jail: confined write to ~/{_rc} is EROFS (Read-Only FS; delayed-exfil bypass closed)", erofs)
-            shutil.rmtree(d, ignore_errors=True)
+            subprocess.run(["bwrap", *_bwa_sh, "--", "python3", _probe], capture_output=True, timeout=20)
+            _persisted = os.path.exists(_tgt) and _PAY in open(_tgt, errors="replace").read()
+            ok(f"FINDING-1: confined plant into MISSING ~/{_rel} does NOT persist to the host", not _persisted)
     finally:
-        for _hp in _created:
-            try: os.unlink(_hp)
-            except OSError: pass
+        shutil.rmtree(_sh, ignore_errors=True)
 
     # 6) C5 — a setsid child inside a confined run is KILLED when the bwrap parent's group is killpg'd
     print("== (b) JAIL PROOF: C5 setsid-child revoke (killpg + --unshare-pid teardown) ==")
