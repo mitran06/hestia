@@ -702,7 +702,8 @@ def _run_exec(token):
         tier = info.get("tier", info.get("decision"))      # tier drives the audit; legacy dicts carry 'decision'
         elevated = info.get("elevated", False)
         wo = info.get("wo", False)                         # legacy _build_payload scope (revoke/kill test dicts only)
-        confined = info.get("confined", False)             # READ from _inflight (set by process()); never recompute
+        confined = info.get("confined", True)              # READ from _inflight (set by process()); never recompute.
+        #   Fail-CLOSED default: an _inflight dict that somehow lacks the key confines rather than runs open.
         pre_ticket = info.get("ticket")                    # auto path pre-mints the ticket UNDER _lock
     status, reason, rc, out_b, err_b = "error", "worker error", None, b"", b""
     try:
