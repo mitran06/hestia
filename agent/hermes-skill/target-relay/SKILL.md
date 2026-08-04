@@ -1,202 +1,167 @@
 ---
 name: target-relay
-description: >-
-  Run commands on the owner's TARGET machine (their laptop/host) from inside the
-  confined box, through the Hestia capability broker. Use this whenever the owner
-  asks you to do something on their computer — read/inspect a file or repo on the
-  target, or (with the owner's approval) act on their private files. You CANNOT
-  reach the target directly; this is the only path, and every crossing is gated by
-  a Telegram button the owner taps. Invoke via the `hestia-relay` client.
+description: "Run commands on the owner's target machine, or fetch files from it, via the LIVE approval broker (hestia-relay). Open a work session and POLL until the owner approves it, then act within it. Commands may return PENDING too — poll them. Inside a session MOST commands run automatically — a reviewer checks each against your stated intent and only dangerous classes ask the owner. This is the ONLY way out of this box."
+version: 3.1.0
+author: Hestia Agent
+license: MIT
+platforms: [linux]
+metadata:
+  hermes:
+    tags: [Broker, target, Laptop, Relay, Approval, Reviewer, Confinement, Session, hestia-relay]
+    related_skills: []
 ---
 
-# Relaying commands to the owner's target machine
+# Reaching the target machine via the approval broker
 
-You run inside `hestia-box`, a network-isolated container. You can reach the
-public internet but you have **no key and no route** to the owner's target
-machine. The only way to run anything there is to REQUEST it through the
-`hestia-relay` client. The request goes to a host-side **broker** that shows the
-owner a **Telegram button**; nothing runs on the target until the owner taps
-approve. You can only ask — you cannot approve on the owner's behalf, and you
-cannot bypass this. Do not try to.
+**This is LIVE.** Ignore any memory that the broker is "not configured", that you are confined to
+`/srv/projects`, that every command needs a tap, or that the relay "always times out" / "is broken".
+Your shell is this box; the broker relays commands to the owner's target machine. There is no key and
+no route here to bypass it. Never try.
 
-## Work sessions (open one before you act, close it when done)
+**There is no `tui` verb.** You cannot drive interactive programs on the laptop. If a memory or an
+older skill says you can, it is wrong — that feature was dropped and never shipped.
 
-Nothing you relay runs unless a **work session** is open. A session is a
-bounded window the owner has approved, anchored to a plain-language statement
-of what you intend to do. Between sessions you have **no access at all** — a
-relayed command with no open session is refused, telling you to open one first.
+## NEVER INVENT RESULTS — read this first
 
-So the moment you realise you need the owner's target machine and no session is
-open, **open one first**:
+Nothing here is instant. Approvals wait on a human. **Exit code 3 means PENDING, not failure, and
+not success.** You have NOT done the work until you see the real output.
 
+- **Never** describe what a command "would have" returned. Only report bytes you actually received.
+- **Exit 124 means you got nothing.** Do not summarise, guess, or reconstruct the output.
+- If a listing comes back **empty, that is a real answer** — say "nothing found". Do not invent
+  filenames, paths, or file contents.
+- If `session-status` never reaches 0, you did **not** do the work. Say exactly that and stop.
+- If you cannot complete a task, report the exit code and what you were waiting on. A truthful
+  "I could not do this" is always correct; a plausible invented answer is always wrong.
+
+## Opening a session — YOU MUST POLL
+
+**Nothing relays unless a session is OPEN.** A command with no open session is refused, not queued.
+
+`session-open` does **not** wait for the owner. It submits and returns immediately, because your
+own terminal tool kills any command at ~120s and the owner may take minutes to tap.
+
+```bash
+hestia-relay session-open --intent "back up my resume and photos" --duration 900
 ```
-hestia-relay session-open --intent "clean up my node projects in /srv/projects" --duration 1800
+
+Read the exit code:
+
+| Code | Meaning | What you do |
+|---|---|---|
+| **0** | owner already tapped Approve | start working |
+| **3** | **PENDING — normal, not an error** | poll `session-status` |
+| 77 | denied | stop; tell the owner |
+| 2 | bad arguments | fix and retry |
+
+If you got **3**, poll until it resolves:
+
+```bash
+hestia-relay session-status
 ```
 
-- `--intent "<one clear line>"` — a short, honest, specific statement of what
-  you are about to do (1–500 chars). The owner reads this **verbatim** on the
-  approvals bot and taps to approve; on approval **your exact words become the
-  trusted anchor** the broker enforces for the whole session. Write it for the
-  owner, not for yourself: concrete scope ("update deps and run the test suite
-  in myrepo"), not vague ("do some work").
-- `--duration <seconds>` — how long you expect to need, **generous but
-  realistic** (any positive number; there is genuinely no ceiling). Expiry at
-  the approved deadline and instant Revoke are the only backstops — the owner
-  can hit 🛑 Revoke at any time, and the window closes automatically when the
-  duration runs out. Ask for enough that you won't have to re-open mid-task,
-  but don't pad it to hours you won't use.
+| Code | Meaning | What you do |
+|---|---|---|
+| **0** | session OPEN (prints seconds left) | start working |
+| **3** | still pending | wait a few seconds, poll again |
+| 77 | denied | stop; tell the owner |
+| 75 | revoked | stop |
+| 124 | expired | open a NEW session |
+| 1 | no session at all | run `session-open` first |
 
-`session-open` blocks until the owner approves (status `session_opened`, with
-the approved `secs`) or declines (`refused` — surface it and ask the owner, do
-not loop). Once it returns `session_opened`, run your commands normally with
-`hestia-relay -- …`. Every command you relay is shown to the owner, one line
-each, live, inside that one session message — so keep your actions matching
-what you said you'd do.
+**`session-status` itself waits up to ~90 seconds before answering.** So:
 
-When you're finished, **close the session** so access ends immediately rather
-than lingering until expiry:
+- Call it **exactly once per command invocation**. It is not instant.
+- **Never** chain it (`for … do … done`), **never** put `sleep` before it, **never** run it twice in
+  one command. Any of those exceed your own ~120s limit and the command gets killed.
+- One call, read the code, act. If it returns 3, call it once more as a separate command.
 
-```
+If it is still pending after two or three such polls, tell the owner you are waiting on their tap
+and stop — do not spin.
+
+Close as soon as you are done. After this you have **no access** until a new session is approved:
+
+```bash
 hestia-relay session-close
 ```
 
-This returns status `session_closed` and the owner's session message shows
-"ended by agent". Closing with no session open is a harmless no-op.
+## Working inside a session
 
-> **Requesting time is not authorization to do anything beyond the stated
-> intent; a broader or different scope needs a NEW session.** If part-way
-> through you find you need to do something your `--intent` didn't cover
-> (touch a different tree, a different kind of change), do NOT stretch the
-> current session to cover it — `session-close` and `session-open` a fresh one
-> with an honest new intent, or tell the owner and let them decide. The window
-> buys you *time*, not *scope*.
-
-Note: for now this window captures your intent and shows the owner **every**
-command you run — it does not yet reduce per-command taps. Commands that need
-approval still get their own button (they're just also logged in the session
-message). A later piece (the reviewer) is what makes the routine, in-scope
-commands stop needing a tap.
-
-## The client
-
-```
-hestia-relay [--cwd DIR] [--elevate] [--timeout SECONDS] -- CMD [ARG...]
+```bash
+hestia-relay [--cwd DIR] [--elevate] [--timeout SECONDS] -- COMMAND [ARG...]
 ```
 
-- `-- CMD [ARG...]` — everything after `--` is the exact command and its
-  arguments, run WITHOUT a shell on the target (no pipes, globs, `&&`, `$()` or
-  redirection — those are shell features and will NOT work; pass a real argv).
-  The `--` is important: it separates relay flags from the command.
-- `--cwd DIR` — the working directory ON THE TARGET (default: `/srv/projects`).
-- `--elevate` — HINT that you expect this needs the owner's private files. It is
-  only a hint: the broker decides independently, and the owner sees an ELEVATED
-  (red) button. Use it when you already know you're touching owner files.
-- `--timeout SECONDS` — how long to wait for the owner's approval + result
-  before giving up (default 900). Raise it if you expect the owner to be slow to
-  tap, or the command to run long.
+Real argv — **no shell, no pipes, no globs, no `$()`**. Blocks until the result returns, prints the
+command's stdout, and mirrors its exit code. Default cwd is the owner's home; pass `--cwd` to change
+it. State honest, specific intents — the reviewer matches commands against them.
 
-The relay blocks until the broker returns a result (or the timeout hits). The
-command's stdout/stderr come back on the relay's stdout/stderr.
+- **Most commands auto-run, no tap.** Reads anywhere, `mkdir`, `mv`/`cp`, scripts and interpreters,
+  read-only and inbound git — if they fit your stated intent. You are not limited to one folder.
+- **Auto-approved commands run CONFINED: full file access, NO NETWORK.** Anything needing the
+  internet — `git fetch`/`clone`/`pull`, `npm`/`pip install`, `curl`, a build that downloads — will
+  **fail with a network error**. That is expected. Re-request the SAME command with `--elevate`.
+- **One tap is asked for the dangerous classes:** sending data OUT (`curl`/`wget`/`scp`/`rsync`
+  to remote/`git push`), reading secrets (`~/.ssh`, `~/.aws`, `~/.gnupg`, `.env`, `*.pem`),
+  `sudo`/root, persistence (`crontab`, systemd units, shell rc files), `rm -rf` of home or large
+  trees. These never auto-run.
+- **Destructive-but-scoped** (`rm` a file, overwriting) auto-runs only if it clearly matches your
+  intent, else it asks.
 
-## Two zones — free vs. elevated
+**`--elevate` = one owner tap, then run UNCONFINED (full access AND network).** Use it for the
+legitimate cases that fail confined. It never bypasses the hard floor — a secret read or `sudo`
+still needs its own approval; it only lifts the no-network confinement.
 
-**Free zone (NO button).** Read-only inspection of the target's shared
-workspace at `/srv/projects`. If, and only if, the command is a bare read-only
-inspector (e.g. `ls cat head tail grep find wc stat file diff tree du` and
-similar), with no elevation, and its cwd and every path argument stay inside
-`/srv/projects`, the broker runs it automatically — no button, instant result.
-This is for quick look-ups the owner has pre-blessed by design.
+**Commands ALSO return 3 (pending) — poll them the same way.** Auto-approved commands usually come
+back within seconds, but anything that needs a tap (`--elevate`, secrets, `sudo`, egress, `rm -rf`)
+waits on the owner. When you get 3:
 
-- Do NOT expect shells/interpreters (`bash sh python node`), `git`, or writers
-  to run free-zone — those always need a button.
-- Value-bearing flags must be SEPARATE tokens: use `-n 5`, not `-n5`; do not
-  glue a path onto a flag (`--foo=/path`). Glued paths force a button or a
-  reject.
-
-```
-# Free-zone examples (auto-run, no owner tap):
-hestia-relay -- ls -la
-hestia-relay --cwd /srv/projects/myrepo -- grep -rn "TODO" .
-hestia-relay -- find . -name '*.md'
+```bash
+hestia-relay command-status      # same rules: ONE call, waits up to ~90s, 3 = poll again
 ```
 
-**Elevated (RED button).** Anything else — writing files, running a build or a
-script, `git`, working outside `/srv/projects`, or touching the OWNER'S OWN
-private files (e.g. their home directory). The owner sees a button showing the
-exact argv and a hash; on approve, the command runs as the owner's own user on
-the target (reaching their private files). Always pass `--elevate` when you know
-you're in this zone, and tell the owner in chat what you're about to request and
-why, so the button isn't a surprise.
+`command-status` prints the command's real output and returns its real exit code once the result
+arrives. Until then you have no output — do not invent any.
 
-```
-# Elevated examples (owner must tap approve):
-hestia-relay --elevate --cwd /home/<owner> -- ls -la Documents
-hestia-relay --elevate --cwd /srv/projects/myrepo -- git status
-hestia-relay --elevate --cwd /srv/projects/myrepo --timeout 1200 -- make build
-```
+Command exit codes: **0** ran · **3** pending (poll `command-status`) · **77** denied/refused ·
+**78** malformed · **75** revoked · **70** broker/internal error · **124** timed out or target
+offline · **1** no pending command / submit failed. A network failure inside a confined auto-run
+shows up as the command's OWN nonzero exit plus a network error in stderr — that is your cue to
+retry with `--elevate`, not a broker failure.
 
-## The approval flow (what to expect)
+**Do not pass a large `--timeout`.** The relay caps its own wait anyway; a big value just gets your
+command killed. Leave it unset and poll `command-status`.
 
-1. You run `hestia-relay -- ...`. It prints `submitted <id> … awaiting owner
-   approval + result` to stderr and blocks.
-2. Free-zone commands come back immediately. Otherwise, if a session is open,
-   the owner gets a per-command Telegram button; they tap approve or deny. If NO
-   session is open, the command is refused — open one first with `session-open`
-   (see "Work sessions" above).
-3. On approve, the target runs the command and the result (stdout/stderr/exit)
-   comes back through the relay. On deny/timeout you get a non-zero exit and a
-   short reason on stderr.
+Every command you run is shown to the owner live, one line in the session message.
 
-A relayed command never opens a session on its own — YOU open the session
-explicitly with `session-open` and close it with `session-close`. Between
-sessions nothing runs; a command with no open session is refused, not queued.
+## Getting a file from the target to the owner
 
-## Exit codes (check these)
+- Text: `hestia-relay -- cat $OWNER_HOME/Documents/report.txt`
+- Find it: `hestia-relay -- find $OWNER_HOME -maxdepth 3 -iname '*resume*' -not -path '*/.cache/*'`
+- **Binary under ~35 KB** — base64 so bytes survive:
+  ```bash
+  hestia-relay -- base64 $OWNER_HOME/photo.jpg > /tmp/photo.b64
+  base64 -d /tmp/photo.b64 > /tmp/photo.jpg
+  ```
+- **Larger than ~35 KB:** one result is capped (~50 KB stdout). Split on the target into `/tmp`, read
+  the chunks back (all auto-approved), concatenate here. See `references/large-file-transfer.md`.
 
-The relay's exit code tells you what happened. On success it mirrors the
-command's own exit code; special codes signal broker outcomes:
+Then **deliver it to the owner** over Telegram. The relay only fetches; you send it on.
 
-| Exit | Meaning |
-|------|---------|
-| `0`  | command ran and exited 0 (success) |
-| non-zero < 70 | command ran but exited non-zero (that's the command's own exit) |
-| `77` | REFUSED — the owner tapped **Deny**, or the broker refused it (policy, caps, or auto-deny on timeout) |
-| `78` | REJECTED — the request was malformed/invalid and rejected before any button |
-| `75` | REVOKED — the session/approval was pulled mid-flight (owner hit 🛑) |
-| `70` | broker/target ERROR while running |
-| `124`| TIMEOUT — no result in time (owner never tapped, target offline, or still pending) |
+## Pitfalls
 
-Do not retry a `77` (denied/refused) by hammering the same command — the owner
-said no or the policy blocked it. Surface it and ask the owner what they'd prefer
-instead. A `78` means you sent a malformed request — fix the argv, don't resend
-as-is. A `124` may just mean the owner was away; you can re-try once with a longer
-`--timeout` after checking with them.
+- **No shell/PTY:** `vim`, `nano`, `htop`, `fzf` hang. Use `find`/`ls`/`grep -r`. You cannot drive them.
+- **Exclude noise** on broad searches: `-not -path '*/.cache/*' -not -path '*/.config/*' -not -path
+  '*/.local/*' -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/snap/*'`.
+- **Empty output is a real answer.** If a listing comes back empty, say so. Do NOT invent filenames,
+  paths, or file contents you did not receive from a command. If you could not get something, report
+  the exit code and stop.
+- **Reading a secret zone** (`~/.ssh`, `.env`, `*.pem`) asks the owner even for a read. Don't route
+  secrets into memory, notes, or the vault; only fetch them if the owner asked for that file.
 
-## Moving files / binary data
+## Etiquette
 
-The relay carries a command and its text output — it is not a file-copy tool,
-and the broker caps result size. For BINARY files or anything the owner needs
-back verbatim, base64-encode on the target and decode in the box:
-
-```
-# Pull a file FROM the target back into the box (elevated if it's an owner file):
-hestia-relay --elevate --cwd /home/<owner> -- base64 report.pdf > /tmp/report.b64
-base64 -d /tmp/report.b64 > /home/hestia/report.pdf   # decode locally in the box
-```
-
-Keep it small — the broker truncates large output (you'll see a "(output
-truncated by broker)" note on stderr). For big transfers, break the file into
-chunks, or prefer the shared vault sync if one is configured.
-
-## Delivering results back to the owner
-
-The owner talks to you over your OWN Telegram bot (separate from the broker's
-approvals bot). After a relayed command:
-
-- Report plainly what you ran, what came back, and the exit status — including
-  failures. Don't overstate success.
-- If you fetched a file, hand it to the owner over your chat gateway (attach it,
-  or paste the relevant text). Don't dump huge raw output; summarize and offer
-  the full result.
-- If a request was denied or timed out, say so and ask how they'd like to
-  proceed — don't silently swallow it or loop on retries.
+- One session per task: open, poll to 0, work, close.
+- If a command needs the network and fails confined, retry once with `--elevate`. Do not loop.
+- If denied, refused, revoked, or timed out: report it plainly and stop. No retry loops, no bypass
+  hunting. Need broader scope? Close and open a new session with an honest new intent.
+- `hestia-relay` only reaches the target. For anything on THIS box, use your normal shell.
