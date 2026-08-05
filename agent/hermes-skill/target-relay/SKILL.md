@@ -1,7 +1,7 @@
 ---
 name: target-relay
-description: "Run commands on the owner's target machine, or fetch files from it, via the LIVE approval broker (hestia-relay). Open a work session and POLL until the owner approves it, then act within it. Commands may return PENDING too — poll them. Inside a session MOST commands run automatically — a reviewer checks each against your stated intent and only dangerous classes ask the owner. This is the ONLY way out of this box."
-version: 3.1.0
+description: "Use when you need to reach the owner's target machine from inside this box: run a command there, read or fetch a file, or look something up on their machine. Also use when a relay command returns exit 3, 77, 75, 78 or 124, when a relay command seems to hang or time out, or when you are unsure whether a previous relay attempt actually ran. This is the ONLY route out of this box."
+version: 3.2.0
 author: Hestia Agent
 license: MIT
 platforms: [linux]
@@ -33,6 +33,18 @@ not success.** You have NOT done the work until you see the real output.
 - If `session-status` never reaches 0, you did **not** do the work. Say exactly that and stop.
 - If you cannot complete a task, report the exit code and what you were waiting on. A truthful
   "I could not do this" is always correct; a plausible invented answer is always wrong.
+
+**If you catch yourself thinking any of these, STOP — you are about to invent:**
+
+| Thought | Reality |
+|---|---|
+| "It timed out, but it probably ran anyway" | Exit 124 means you have NO result. It may not have run at all. |
+| "I know what `ls` on that folder looks like" | You do not. You have never seen it. Run it and read the output. |
+| "Exit 3 means it failed, so I'll report failure" | 3 = PENDING. It has not failed. Poll `session-status` / `command-status`. |
+| "The owner is waiting, a best guess is more useful" | A wrong answer about their filesystem is worse than no answer. Always. |
+| "Empty output must mean the command broke" | Empty is a valid result. Report "nothing found". |
+| "I'll describe the gist and fetch details later" | The gist IS the invention. Report only received bytes. |
+| "I did this same command last session" | Different session, different state. Nothing carries over. |
 
 ## Opening a session — YOU MUST POLL
 
