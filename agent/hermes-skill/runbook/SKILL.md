@@ -71,6 +71,17 @@ something you actually ran — if you cannot fill `## Verify`, record it as a `s
 
 Keep a note under 200 lines. Past that, split it by subject.
 
+## Research dumps
+
+Long research output goes to `_raw/YYYY-MM-DD-topic.md` — the whole thing, written once and left
+alone. This is the archive, and it is separate from the notes on purpose: the last vault died
+because dumps and curated notes shared a folder.
+
+Anything worth acting on later earns its own `how-to`, `system` or `decision` note. The dump is
+where you go back for the detail those notes leave out.
+
+Search `_raw/` with grep. Hindsight indexes conversations, not files, so it will not surface these.
+
 ## Reading and writing files
 
 Use the `obsidian` skill for the file mechanics — it resolves the vault path from

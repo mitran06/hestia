@@ -9,7 +9,7 @@ Two vaults, different owners and different jobs:
 |---|---|---|
 | Written by | agent, from the owner's messages | agent, about its own work |
 | Read by | **the owner**, on their phone | the agent |
-| Holds | journal, people, projects, courses, lists, resources | verified procedures, decisions |
+| Holds | journal, people, projects, courses, lists, resources | verified procedures, decisions, raw research dumps |
 | Trigger | the owner texts something | none reliable — see below |
 
 ## The spine: Current and History
@@ -39,6 +39,14 @@ structurally rather than trying to merge them.
 `vault-digest.sh` (weekly) and `vault-alarm.sh` (daily) run as plain scripts with **no LLM**. The
 digest **sends even when every number is zero** — a vault dies by going quiet, and a missing message
 is far harder to notice than one reading `0 new, last write 34d ago`.
+
+## Raw dumps
+
+The runbook vault keeps `_raw/YYYY-MM-DD-topic.md` — full research output, written once, never
+edited. Kept separate from the curated notes deliberately: the first vault died because dumps and
+notes shared a folder, and six long reports were the whole vault.
+
+Retrieval is grep. Hindsight indexes conversations, not files, so it will not surface these.
 
 ## Known limitation
 
